@@ -2,6 +2,8 @@
 
 import json
 import queue
+import threading
+import time
 
 from api import config, models, routes, streaming
 from api.models import Session
@@ -63,6 +65,119 @@ def test_concurrent_chat_start_queues_second_turn_durably_once_with_attachments(
     assert queued["turn_id"] == response["turn_id"]
     assert queued["client_turn_id"] == "desktop-turn-2"
     assert session.pending_user_message == "compress"
+
+
+def test_two_overlapping_desktop_chat_start_requests_run_second_once_after_release(
+    tmp_path, monkeypatch
+):
+    """Exercise the real POST /api/chat/start seam while request one owns the SID."""
+    session, _session_dir = _install_session(tmp_path, monkeypatch)
+    session.active_stream_id = None
+    session.pending_user_message = None
+    session.pending_started_at = None
+    session.save()
+    config.STREAMS.clear()
+    started = threading.Event()
+    release = threading.Event()
+    finished = threading.Event()
+    calls = []
+    workers = []
+
+    def fake_stream_worker(sid, message, _model, _workspace, stream_id, attachments, **_kwargs):
+        calls.append((sid, message, attachments, stream_id))
+        if message == "first turn":
+            started.set()
+            assert release.wait(timeout=3)
+        with routes._get_session_agent_lock(sid):
+            config.STREAMS.pop(stream_id, None)
+            config.ACTIVE_RUNS.pop(stream_id, None)
+            session.active_stream_id = None
+            session.pending_user_message = None
+            session.pending_started_at = None
+            session.save(touch_updated_at=False)
+        routes.drain_queued_user_turns_for_session(sid)
+        if message == "second turn":
+            finished.set()
+
+    real_thread = threading.Thread
+
+    class TrackedThread(real_thread):
+        def start(self):
+            workers.append(self)
+            return super().start()
+
+    monkeypatch.setattr(routes.threading, "Thread", TrackedThread)
+    monkeypatch.setattr(routes, "_run_agent_streaming", fake_stream_worker)
+    monkeypatch.setattr(routes, "_get_or_materialize_session", lambda *_a, **_k: session)
+    monkeypatch.setattr(routes, "_session_visible_to_active_profile", lambda *_a, **_k: True)
+    monkeypatch.setattr(routes, "_resolve_chat_workspace_with_recovery", lambda *_a, **_k: str(tmp_path))
+    monkeypatch.setattr(routes, "_read_profile_model_config", lambda *_a, **_k: (None, None, None))
+    monkeypatch.setattr(
+        routes,
+        "_resolve_compatible_session_model_state",
+        lambda *_a, **_k: ("test-model", "test-provider", False),
+    )
+    monkeypatch.setattr(routes, "_agent_runtime_barrier_response", lambda **_k: None)
+    monkeypatch.setattr(
+        routes,
+        "_start_run",
+        lambda s, **kwargs: routes._start_chat_stream_for_session(
+            s,
+            msg=kwargs["msg"],
+            attachments=kwargs["attachments"],
+            workspace=kwargs["workspace"],
+            model=kwargs["model"],
+            model_provider=kwargs["model_provider"],
+            source=kwargs["source"],
+            client_turn_id=kwargs.get("client_turn_id"),
+        ),
+    )
+    monkeypatch.setattr(
+        routes,
+        "j",
+        lambda _handler, payload, status=200: {"http_status": status, **payload},
+    )
+
+    first = routes._handle_chat_start(
+        None,
+        {
+            "session_id": session.session_id,
+            "message": "first turn",
+            "workspace": str(tmp_path),
+            "client_turn_id": "desktop-first",
+        },
+    )
+    assert first["stream_id"]
+    assert started.wait(timeout=3)
+
+    second = routes._handle_chat_start(
+        None,
+        {
+            "session_id": session.session_id,
+            "message": "second turn",
+            "attachments": [{"name": "checkpoint.png", "path": "/safe/checkpoint.png"}],
+            "workspace": str(tmp_path),
+            "client_turn_id": "desktop-second",
+        },
+    )
+    assert second["http_status"] == 202
+    assert second["status"] == "queued"
+    assert [row["message"] for row in session.queued_user_turns] == ["second turn"]
+
+    release.set()
+    assert finished.wait(timeout=3)
+    deadline = time.monotonic() + 3
+    for worker in list(workers):
+        worker.join(timeout=max(0, deadline - time.monotonic()))
+
+    assert [message for _sid, message, _attachments, _stream in calls] == [
+        "first turn",
+        "second turn",
+    ]
+    assert calls[1][2] == [
+        {"name": "checkpoint.png", "path": "/safe/checkpoint.png", "mime": ""}
+    ]
+    assert session.queued_user_turns == []
 
 
 def test_duplicate_client_turn_id_returns_same_receipt_and_drains_once(
