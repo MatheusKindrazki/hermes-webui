@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import json
+import queue
 import sqlite3
 
 import pytest
 
+from api import config, models, routes, streaming
 from api.client_turn_ledger import (
     ClientTurnLedger,
     ClientTurnPayloadMismatch,
@@ -112,3 +114,72 @@ def test_same_client_turn_id_with_different_payload_is_conflict(tmp_path):
 
     assert exc_info.value.status_code == 409
     assert exc_info.value.code == "client_turn_id_payload_mismatch"
+
+
+def _install_route_session(tmp_path, monkeypatch):
+    state_dir = tmp_path / "state"
+    session_dir = state_dir / "sessions"
+    session_dir.mkdir(parents=True)
+    monkeypatch.setattr(config, "STATE_DIR", state_dir)
+    monkeypatch.setattr(models, "SESSION_DIR", session_dir)
+    monkeypatch.setattr(models, "SESSION_INDEX_FILE", session_dir / "_index.json")
+    monkeypatch.setattr(routes, "SESSION_DIR", session_dir)
+    monkeypatch.setattr(streaming, "SESSION_DIR", session_dir)
+    monkeypatch.setenv("HERMES_TURN_LEDGER_ENABLED", "1")
+    models.SESSIONS.clear()
+    routes.SESSIONS.clear()
+    streaming.SESSIONS.clear()
+    config.STREAMS.clear()
+    config.ACTIVE_RUNS.clear()
+    session = models.Session(
+        session_id="ledger-session",
+        workspace=str(tmp_path),
+        messages=[],
+        profile="work",
+    )
+    session.save()
+    models.SESSIONS[session.session_id] = session
+    routes.SESSIONS[session.session_id] = session
+    streaming.SESSIONS[session.session_id] = session
+    return session
+
+
+def test_start_retry_returns_original_receipt_without_second_worker(tmp_path, monkeypatch):
+    session = _install_route_session(tmp_path, monkeypatch)
+    started_threads = []
+
+    class NoopThread:
+        def __init__(self, *args, **kwargs):
+            self.args = args
+            self.kwargs = kwargs
+
+        def start(self):
+            started_threads.append((self.args, self.kwargs))
+
+    monkeypatch.setattr(routes.threading, "Thread", NoopThread)
+    monkeypatch.setattr(routes, "create_stream_channel", queue.Queue)
+    monkeypatch.setattr(routes, "set_last_workspace", lambda _workspace: None)
+
+    kwargs = {
+        "msg": "run this once",
+        "attachments": [{"name": "evidence.txt", "size": 12}],
+        "workspace": str(tmp_path),
+        "model": "test-model",
+        "model_provider": "test-provider",
+        "client_turn_id": "browser-retry-1",
+    }
+    first = routes._start_chat_stream_for_session(session, **kwargs)
+    retry = routes._start_chat_stream_for_session(session, **kwargs)
+
+    assert retry == first
+    assert retry["stream_id"] == first["stream_id"]
+    assert retry["turn_id"] == first["turn_id"]
+    assert len(started_threads) == 1
+    assert session.queued_user_turns == []
+
+    mismatch = routes._start_chat_stream_for_session(
+        session,
+        **{**kwargs, "msg": "different payload"},
+    )
+    assert mismatch["_status"] == 409
+    assert mismatch["code"] == "client_turn_id_payload_mismatch"

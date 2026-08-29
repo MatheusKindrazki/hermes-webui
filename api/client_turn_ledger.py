@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -247,3 +248,17 @@ class ClientTurnLedger:
             conn.commit()
         return dict(row)
 
+
+_DEFAULT_LEDGER_CACHE: dict[Path, ClientTurnLedger] = {}
+_DEFAULT_LEDGER_CACHE_LOCK = threading.Lock()
+
+
+def default_client_turn_ledger() -> ClientTurnLedger:
+    """Return one store per resolved WebUI state directory."""
+    path = _default_db_path().expanduser().resolve()
+    with _DEFAULT_LEDGER_CACHE_LOCK:
+        ledger = _DEFAULT_LEDGER_CACHE.get(path)
+        if ledger is None:
+            ledger = ClientTurnLedger(path)
+            _DEFAULT_LEDGER_CACHE[path] = ledger
+        return ledger
