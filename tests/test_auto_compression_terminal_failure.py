@@ -7,7 +7,7 @@ import sys
 import types
 from pathlib import Path
 
-from api import models, streaming
+from api import config, models, routes, streaming
 from api.models import Session
 from api.streaming import (
     _agent_result_terminal_failure,
@@ -53,6 +53,7 @@ def test_compression_exhausted_after_session_rotation_preserves_snapshot_and_err
     streaming.SESSIONS[old_sid] = session
     event_queue = queue.Queue()
     streaming.STREAMS[stream_id] = event_queue
+    teardown_observations = []
 
     class FakeAgent:
         def __init__(
@@ -116,6 +117,18 @@ def test_compression_exhausted_after_session_rotation_preserves_snapshot_and_err
         m.setattr(streaming, "resolve_model_provider", lambda *_args, **_kwargs: ("gpt-4o", "openai", None))
         m.setattr("api.config.get_config", lambda *_args, **_kwargs: {})
         m.setattr("api.config._resolve_cli_toolsets", lambda *_args, **_kwargs: [])
+        m.setattr(
+            routes,
+            "drain_queued_user_turns_for_session",
+            lambda sid: teardown_observations.append(
+                {
+                    "sid": sid,
+                    "stream_registered": stream_id in streaming.STREAMS,
+                    "active_run_registered": stream_id in config.ACTIVE_RUNS,
+                    "active_stream_id": getattr(session, "active_stream_id", None),
+                }
+            ) or False,
+        )
         m.setitem(sys.modules, "hermes_state", fake_hermes_state)
         streaming._run_agent_streaming(
             session_id=old_sid,
@@ -124,6 +137,15 @@ def test_compression_exhausted_after_session_rotation_preserves_snapshot_and_err
             workspace=str(tmp_path),
             stream_id=stream_id,
         )
+
+    assert teardown_observations == [
+        {
+            "sid": new_sid,
+            "stream_registered": False,
+            "active_run_registered": False,
+            "active_stream_id": None,
+        }
+    ]
 
     events = []
     while not event_queue.empty():

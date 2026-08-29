@@ -22665,6 +22665,461 @@ def _active_stream_blocks_chat_start(session, stream_id: str | None) -> bool:
     return False
 
 
+_QUEUED_USER_TURN_DRAINS = set()
+_QUEUED_USER_TURN_DRAINS_LOCK = threading.Lock()
+MAX_QUEUED_USER_TURNS = 32
+
+_CLIENT_TURN_ADMISSIONS_IN_FLIGHT: dict[tuple[str, str], int] = {}
+_CLIENT_TURN_ADMISSIONS_IN_FLIGHT_LOCK = threading.Lock()
+
+
+class ClientTurnAdmissionCrash(BaseException):
+    """Test-only process-crash simulation after a durable ledger claim."""
+
+
+def _client_turn_admission_key(context) -> tuple[str, str]:
+    return (context["lineage_root_id"], context["client_turn_id"])
+
+
+def _begin_client_turn_admission(context) -> None:
+    if context is None:
+        return
+    key = _client_turn_admission_key(context)
+    with _CLIENT_TURN_ADMISSIONS_IN_FLIGHT_LOCK:
+        _CLIENT_TURN_ADMISSIONS_IN_FLIGHT[key] = (
+            _CLIENT_TURN_ADMISSIONS_IN_FLIGHT.get(key, 0) + 1
+        )
+
+
+def _end_client_turn_admission(context) -> None:
+    if context is None:
+        return
+    key = _client_turn_admission_key(context)
+    with _CLIENT_TURN_ADMISSIONS_IN_FLIGHT_LOCK:
+        remaining = _CLIENT_TURN_ADMISSIONS_IN_FLIGHT.get(key, 0) - 1
+        if remaining > 0:
+            _CLIENT_TURN_ADMISSIONS_IN_FLIGHT[key] = remaining
+        else:
+            _CLIENT_TURN_ADMISSIONS_IN_FLIGHT.pop(key, None)
+
+
+def _client_turn_admission_in_flight(context) -> bool:
+    key = _client_turn_admission_key(context)
+    with _CLIENT_TURN_ADMISSIONS_IN_FLIGHT_LOCK:
+        return _CLIENT_TURN_ADMISSIONS_IN_FLIGHT.get(key, 0) > 0
+
+
+def _client_turn_failpoint(context, name: str) -> None:
+    configured = str(
+        os.getenv("HERMES_WEBUI_CLIENT_TURN_FAILPOINT", "") or ""
+    ).strip()
+    if configured != name:
+        return
+    # A real process crash clears process-local ownership. Mirror that fact so
+    # the next request exercises restart reconciliation in the same test process.
+    _end_client_turn_admission(context)
+    raise ClientTurnAdmissionCrash(name)
+
+
+def _client_turn_ledger_enabled(session=None) -> bool:
+    from api.reliability_flags import reliability_feature_enabled
+
+    return reliability_feature_enabled(
+        "HERMES_TURN_LEDGER_ENABLED",
+        "turn_ledger",
+        session=session,
+    )
+
+
+def _client_turn_lineage_root_id(session) -> str:
+    """Resolve the oldest compression parent without changing session state."""
+    root = str(getattr(session, "session_id", "") or "").strip()
+    parent = str(getattr(session, "parent_session_id", "") or "").strip()
+    seen = {root} if root else set()
+    while parent and parent not in seen:
+        root = parent
+        seen.add(parent)
+        try:
+            parent_session = Session.load(parent)
+        except Exception:
+            parent_session = None
+        if parent_session is None:
+            break
+        parent = str(getattr(parent_session, "parent_session_id", "") or "").strip()
+    return root or str(getattr(session, "session_id", "") or "")
+
+
+def _client_turn_request_sha256(
+    *,
+    message,
+    attachments,
+    workspace,
+    model,
+    model_provider,
+    source,
+) -> str:
+    payload = {
+        "message": str(message),
+        "attachments": list(attachments or []),
+        "workspace": str(workspace),
+        "model": model,
+        "model_provider": model_provider,
+        "source": str(source or "webui"),
+    }
+    encoded = json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _client_turn_ledger_context(
+    session,
+    *,
+    client_turn_id,
+    message,
+    attachments,
+    workspace,
+    model,
+    model_provider,
+    source,
+):
+    client_id = str(client_turn_id or "").strip()[:128]
+    if not client_id or not _client_turn_ledger_enabled(session):
+        return None
+    from api.client_turn_ledger import default_client_turn_ledger
+
+    return {
+        "ledger": default_client_turn_ledger(),
+        "lineage_root_id": _client_turn_lineage_root_id(session),
+        "client_turn_id": client_id,
+        "session_id": str(getattr(session, "session_id", "") or ""),
+        "request_sha256": _client_turn_request_sha256(
+            message=message,
+            attachments=attachments,
+            workspace=workspace,
+            model=model,
+            model_provider=model_provider,
+            source=source,
+        ),
+    }
+
+
+def _client_turn_receipt_from_record(record) -> dict:
+    try:
+        receipt = json.loads(str(record.get("receipt_json") or "{}"))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        receipt = {}
+    if not isinstance(receipt, dict):
+        receipt = {}
+    return receipt
+
+
+def _client_turn_terminal_error(record) -> dict:
+    state = str(record.get("state") or "")
+    recovery_required = state == "recovery_required"
+    return {
+        "error": (
+            "Turn admission was interrupted before recoverable work was persisted."
+            if recovery_required
+            else "The previous turn attempt failed before it could complete."
+        ),
+        "code": (
+            "client_turn_recovery_required"
+            if recovery_required
+            else "client_turn_failed_retryable"
+        ),
+        "retryable": not recovery_required,
+        "turn_id": record.get("turn_id"),
+        "session_id": record.get("current_session_id"),
+        "stream_id": record.get("stream_id"),
+        "_status": 409 if recovery_required else 503,
+    }
+
+
+def _client_turn_has_durable_work(context, record) -> bool:
+    """Validate that a queued/started receipt still points at executable work."""
+    if _client_turn_admission_in_flight(context):
+        return True
+    state = str(record.get("state") or "")
+    if state == "queued":
+        try:
+            persisted = Session.load(str(record.get("current_session_id") or ""))
+        except Exception:
+            persisted = None
+        return any(
+            str(row.get("turn_id") or "") == str(record.get("turn_id") or "")
+            for row in list(getattr(persisted, "queued_user_turns", None) or [])
+            if isinstance(row, dict)
+        )
+    if state == "started":
+        stream_id = str(record.get("stream_id") or "")
+        if not stream_id:
+            return False
+        with STREAMS_LOCK:
+            if stream_id in STREAMS:
+                return True
+        try:
+            with ACTIVE_RUNS_LOCK:
+                return stream_id in (ACTIVE_RUNS or {})
+        except Exception:
+            return False
+    return state == "completed"
+
+
+def _client_turn_existing_response(context, *, queued_turn_id=None):
+    if context is None:
+        return None, None
+    from api.client_turn_ledger import ClientTurnPayloadMismatch
+
+    record = context["ledger"].get(
+        context["lineage_root_id"], context["client_turn_id"]
+    )
+    if record is None:
+        return None, None
+    if str(record.get("request_sha256") or "") != context["request_sha256"]:
+        mismatch = ClientTurnPayloadMismatch(
+            "client_turn_id was already used for a different payload"
+        )
+        return {
+            "error": str(mismatch),
+            "code": mismatch.code,
+            "_status": mismatch.status_code,
+        }, record
+    state = str(record.get("state") or "")
+    if state in {"recovery_required", "failed_retryable"}:
+        return _client_turn_terminal_error(record), record
+    if state in {"queued", "started"} and not _client_turn_has_durable_work(
+        context, record
+    ):
+        record = context["ledger"].transition(
+            context["lineage_root_id"],
+            context["client_turn_id"],
+            state="recovery_required",
+            stream_id=record.get("stream_id"),
+            current_session_id=record.get("current_session_id"),
+        )
+        return _client_turn_terminal_error(record), record
+    if (
+        queued_turn_id
+        and str(record.get("turn_id") or "") == str(queued_turn_id)
+        and str(record.get("state") or "") == "queued"
+    ):
+        return None, record
+    return _client_turn_receipt_from_record(record), record
+
+
+def _enqueue_queued_user_turn(
+    session,
+    *,
+    message: str,
+    attachments,
+    workspace: str,
+    model,
+    model_provider,
+    source: str,
+    client_turn_id: str | None = None,
+    turn_id: str | None = None,
+):
+    """Append one immutable successor intent while the current turn owns the SID."""
+    client_id = str(client_turn_id or "").strip()[:128]
+    session.queued_user_turns = list(getattr(session, "queued_user_turns", None) or [])
+    if client_id:
+        for existing in session.queued_user_turns:
+            if str(existing.get("client_turn_id") or "") == client_id:
+                return existing
+    if len(session.queued_user_turns) >= MAX_QUEUED_USER_TURNS:
+        raise OverflowError("queued user turn limit reached")
+    queued = {
+        "turn_id": str(turn_id or f"queued-{uuid.uuid4().hex}"),
+        "client_turn_id": client_id or None,
+        "message": str(message),
+        "attachments": copy.deepcopy(list(attachments or [])),
+        "workspace": str(workspace),
+        "model": model,
+        "model_provider": model_provider,
+        "source": str(source or "webui"),
+        "created_at": time.time(),
+    }
+    session.queued_user_turns.append(queued)
+    session.save(touch_updated_at=False)
+    return queued
+
+
+def _queued_chat_start_response(session, queued, active_stream_id):
+    return {
+        "status": "queued",
+        "turn_id": queued["turn_id"],
+        "session_id": session.session_id,
+        "active_stream_id": active_stream_id,
+        "_status": 202,
+    }
+
+
+def _queue_active_chat_start_locked(
+    session,
+    *,
+    active_stream_id,
+    msg,
+    attachments,
+    workspace,
+    model,
+    model_provider,
+    source,
+    client_turn_id,
+    ledger_context=None,
+):
+    queued_turns = list(getattr(session, "queued_user_turns", None) or [])
+    client_id = str(client_turn_id or "").strip()[:128]
+    if client_id:
+        for existing in queued_turns:
+            if str(existing.get("client_turn_id") or "") == client_id:
+                return _queued_chat_start_response(
+                    session, existing, active_stream_id
+                )
+    if len(queued_turns) >= MAX_QUEUED_USER_TURNS:
+        return {
+            "error": "Too many messages are already queued for this session.",
+            "code": "queued_turn_limit",
+            "queue_limit": MAX_QUEUED_USER_TURNS,
+            "active_stream_id": active_stream_id,
+            "_status": 429,
+        }
+    reserved_turn_id = f"queued-{uuid.uuid4().hex}"
+    ledger_record = None
+    if ledger_context is not None:
+        receipt = {
+            "status": "queued",
+            "turn_id": reserved_turn_id,
+            "session_id": session.session_id,
+            "active_stream_id": active_stream_id,
+            "_status": 202,
+        }
+        _begin_client_turn_admission(ledger_context)
+        try:
+            ledger_record, created = ledger_context["ledger"].claim(
+                lineage_root_id=ledger_context["lineage_root_id"],
+                client_turn_id=ledger_context["client_turn_id"],
+                turn_id=reserved_turn_id,
+                current_session_id=session.session_id,
+                stream_id=None,
+                request_sha256=ledger_context["request_sha256"],
+                receipt=receipt,
+                state="queued",
+            )
+        except Exception:
+            _end_client_turn_admission(ledger_context)
+            raise
+        if not created:
+            _end_client_turn_admission(ledger_context)
+            return _client_turn_receipt_from_record(ledger_record)
+        _client_turn_failpoint(ledger_context, "after_queued_claim")
+    try:
+        queued = _enqueue_queued_user_turn(
+            session,
+            message=msg,
+            attachments=attachments,
+            workspace=workspace,
+            model=model,
+            model_provider=model_provider,
+            source=source,
+            client_turn_id=client_turn_id,
+            turn_id=reserved_turn_id if ledger_context is not None else None,
+        )
+    except OverflowError:
+        if ledger_context is not None and ledger_record is not None:
+            ledger_context["ledger"].transition(
+                ledger_context["lineage_root_id"],
+                ledger_context["client_turn_id"],
+                state="recovery_required",
+            )
+            _end_client_turn_admission(ledger_context)
+        return {
+            "error": "Too many messages are already queued for this session.",
+            "code": "queued_turn_limit",
+            "queue_limit": MAX_QUEUED_USER_TURNS,
+            "active_stream_id": active_stream_id,
+            "_status": 429,
+        }
+    except Exception:
+        if ledger_context is not None and ledger_record is not None:
+            ledger_context["ledger"].transition(
+                ledger_context["lineage_root_id"],
+                ledger_context["client_turn_id"],
+                state="recovery_required",
+            )
+            _end_client_turn_admission(ledger_context)
+        raise
+    if ledger_context is not None and ledger_record is not None:
+        try:
+            ledger_context["ledger"].set_admission_anchor(
+                ledger_context["lineage_root_id"],
+                ledger_context["client_turn_id"],
+                phase="queue_persisted",
+            )
+        finally:
+            _end_client_turn_admission(ledger_context)
+    return _queued_chat_start_response(session, queued, active_stream_id)
+
+
+def drain_queued_user_turns_for_session(session_id: str) -> bool:
+    """Start at most one durable successor intent using the current lineage tip."""
+    sid = str(session_id or "").strip()
+    if not sid:
+        return False
+    with _QUEUED_USER_TURN_DRAINS_LOCK:
+        if sid in _QUEUED_USER_TURN_DRAINS:
+            return False
+        _QUEUED_USER_TURN_DRAINS.add(sid)
+    try:
+        try:
+            session = get_session(sid)
+        except KeyError:
+            return False
+        queued_turns = list(getattr(session, "queued_user_turns", None) or [])
+        if not queued_turns:
+            return False
+        if compression_recovery_payload_for_session(session):
+            changed = False
+            for item in queued_turns:
+                if isinstance(item, dict) and not item.get("recovery_required"):
+                    item["recovery_required"] = True
+                    changed = True
+            if changed:
+                session.queued_user_turns = queued_turns
+                session.save(touch_updated_at=False)
+            return False
+        if getattr(session, "active_stream_id", None) or _active_run_stream_for_session(sid):
+            return False
+        item = queued_turns[0]
+        result = _start_chat_stream_for_session(
+            session,
+            msg=str(item.get("message") or ""),
+            attachments=copy.deepcopy(item.get("attachments") or []),
+            workspace=str(item.get("workspace") or session.workspace),
+            model=item.get("model") or session.model,
+            model_provider=item.get("model_provider") or session.model_provider,
+            source=str(item.get("source") or "webui"),
+            queued_turn_id=str(item.get("turn_id") or ""),
+            client_turn_id=str(item.get("client_turn_id") or ""),
+        )
+        if result.get("stream_id") and not result.get("_status"):
+            # Test doubles and legacy delegates do not consume the durable item
+            # inside the start transaction, so close it here after acceptance.
+            session.queued_user_turns = [
+                row for row in list(getattr(session, "queued_user_turns", None) or [])
+                if row.get("turn_id") != item.get("turn_id")
+            ]
+            session.save(touch_updated_at=False)
+            return True
+        return bool(result.get("stream_id") and int(result.get("_status", 200)) < 300)
+    finally:
+        with _QUEUED_USER_TURN_DRAINS_LOCK:
+            _QUEUED_USER_TURN_DRAINS.discard(sid)
+
+
 def _start_regeneration_stream_locked(
     s,
     *,
@@ -23040,6 +23495,8 @@ def _start_chat_stream_for_session(
     moa_config=None,
     external_runtime_owned: bool | None = None,
     regeneration=None,
+    queued_turn_id: str | None = None,
+    client_turn_id: str | None = None,
 ):
     """Persist pending state, register an SSE channel, and start an agent turn."""
     if external_runtime_owned is None:
@@ -23052,6 +23509,24 @@ def _start_chat_stream_for_session(
         stale_response["_status"] = 409
         return stale_response
     attachments = attachments or []
+    ledger_context = _client_turn_ledger_context(
+        s,
+        client_turn_id=client_turn_id,
+        message=msg,
+        attachments=attachments,
+        workspace=workspace,
+        model=model,
+        model_provider=model_provider,
+        source=source,
+    )
+    existing_ledger_response, existing_ledger_record = _client_turn_existing_response(
+        ledger_context,
+        queued_turn_id=queued_turn_id,
+    )
+    if existing_ledger_response is not None:
+        return existing_ledger_response
+    ledger_turn_id = None
+    stream = None
     # Prevent duplicate runs in the same session while a stream is still active.
     # This commonly happens after page refresh/reconnect races and can produce
     # duplicated clarify cards for what appears to be a single user request.
@@ -23059,12 +23534,31 @@ def _start_chat_stream_for_session(
     current_stream_id = getattr(s, "active_stream_id", None)
     if current_stream_id:
         if _active_stream_blocks_chat_start(s, current_stream_id):
-            diag.stage("response_write") if diag else None
-            return {
-                "error": "session already has an active stream",
-                "active_stream_id": current_stream_id,
-                "_status": 409,
-            }
+            if source == "webui" and regeneration is None and not queued_turn_id:
+                with _get_session_agent_lock(s.session_id):
+                    locked_stream_id = getattr(s, "active_stream_id", None)
+                    if locked_stream_id and _active_stream_blocks_chat_start(
+                        s, locked_stream_id
+                    ):
+                        return _queue_active_chat_start_locked(
+                            s,
+                            active_stream_id=locked_stream_id,
+                            msg=msg,
+                            attachments=attachments,
+                            workspace=workspace,
+                            model=model,
+                            model_provider=model_provider,
+                            source=source,
+                            client_turn_id=client_turn_id,
+                            ledger_context=ledger_context,
+                        )
+            else:
+                diag.stage("response_write") if diag else None
+                return {
+                    "error": "session already has an active stream",
+                    "active_stream_id": current_stream_id,
+                    "_status": 409,
+                }
         # Stale stream id from a previous run; clear and continue.
         diag.stage("stale_stream_cleanup") if diag else None
         _clear_stale_stream_state(s)
@@ -23091,6 +23585,19 @@ def _start_chat_stream_for_session(
             locked_stream_id = getattr(s, "active_stream_id", None)
             if locked_stream_id:
                 if _active_stream_blocks_chat_start(s, locked_stream_id):
+                    if source == "webui" and regeneration is None and not queued_turn_id:
+                        return _queue_active_chat_start_locked(
+                            s,
+                            active_stream_id=locked_stream_id,
+                            msg=msg,
+                            attachments=attachments,
+                            workspace=workspace,
+                            model=model,
+                            model_provider=model_provider,
+                            source=source,
+                            client_turn_id=client_turn_id,
+                            ledger_context=ledger_context,
+                        )
                     diag.stage("response_write") if diag else None
                     return {
                         "error": "session already has an active stream",
@@ -23101,6 +23608,19 @@ def _start_chat_stream_for_session(
             else:
                 blocking_run_stream_id = _active_run_stream_for_session(s.session_id)
                 if blocking_run_stream_id:
+                    if source == "webui" and regeneration is None and not queued_turn_id:
+                        return _queue_active_chat_start_locked(
+                            s,
+                            active_stream_id=blocking_run_stream_id,
+                            msg=msg,
+                            attachments=attachments,
+                            workspace=workspace,
+                            model=model,
+                            model_provider=model_provider,
+                            source=source,
+                            client_turn_id=client_turn_id,
+                            ledger_context=ledger_context,
+                        )
                     diag.stage("response_write") if diag else None
                     return {
                         "error": "session already has an active stream",
@@ -23123,18 +23643,113 @@ def _start_chat_stream_for_session(
                         backend_is_gateway=backend_is_gateway,
                     )
                 stream_id = uuid.uuid4().hex
+                started_at = time.time()
+                if ledger_context is not None:
+                    ledger_turn_id = (
+                        str(queued_turn_id)
+                        if queued_turn_id
+                        else f"turn-{uuid.uuid4().hex}"
+                    )
+                    if existing_ledger_record is not None:
+                        _begin_client_turn_admission(ledger_context)
+                        try:
+                            ledger_context["ledger"].set_admission_anchor(
+                                ledger_context["lineage_root_id"],
+                                ledger_context["client_turn_id"],
+                                phase="claimed",
+                            )
+                            ledger_context["ledger"].transition(
+                                ledger_context["lineage_root_id"],
+                                ledger_context["client_turn_id"],
+                                state="started",
+                                stream_id=stream_id,
+                                current_session_id=s.session_id,
+                            )
+                        except Exception:
+                            _end_client_turn_admission(ledger_context)
+                            raise
+                    else:
+                        next_title = getattr(s, "title", None)
+                        if _is_default_or_empty_session_title(next_title):
+                            next_title = _provisional_title_from_prompt(
+                                msg, next_title or "Untitled"
+                            )
+                        receipt = {
+                            "stream_id": stream_id,
+                            "session_id": s.session_id,
+                            "pending_started_at": started_at,
+                            "turn_id": ledger_turn_id,
+                            "title": next_title,
+                        }
+                        if normalized_model:
+                            receipt["effective_model"] = model
+                        if model_provider:
+                            receipt["effective_model_provider"] = model_provider
+                        _begin_client_turn_admission(ledger_context)
+                        try:
+                            claimed_record, created = ledger_context["ledger"].claim(
+                                lineage_root_id=ledger_context["lineage_root_id"],
+                                client_turn_id=ledger_context["client_turn_id"],
+                                turn_id=ledger_turn_id,
+                                current_session_id=s.session_id,
+                                stream_id=stream_id,
+                                request_sha256=ledger_context["request_sha256"],
+                                receipt=receipt,
+                                state="started",
+                            )
+                        except Exception:
+                            _end_client_turn_admission(ledger_context)
+                            raise
+                        if not created:
+                            _end_client_turn_admission(ledger_context)
+                            return _client_turn_receipt_from_record(claimed_record)
+                    _client_turn_failpoint(
+                        ledger_context,
+                        "after_started_claim",
+                    )
+                if queued_turn_id:
+                    s.queued_user_turns = [
+                        row for row in list(getattr(s, "queued_user_turns", None) or [])
+                        if str(row.get("turn_id") or "") != queued_turn_id
+                    ]
                 diag.stage("save_pending_state") if diag else None
                 was_hidden_empty_session = _is_hidden_empty_session(s)
-                _prepare_chat_start_session_for_stream(
-                    s,
-                    msg=msg,
-                    attachments=attachments,
-                    workspace=workspace,
-                    model=model,
-                    model_provider=model_provider,
-                    stream_id=stream_id,
-                    source=source,
-                )
+                try:
+                    _prepare_chat_start_session_for_stream(
+                        s,
+                        msg=msg,
+                        attachments=attachments,
+                        workspace=workspace,
+                        model=model,
+                        model_provider=model_provider,
+                        stream_id=stream_id,
+                        started_at=started_at,
+                        source=source,
+                    )
+                except Exception:
+                    if ledger_context is not None:
+                        ledger_context["ledger"].transition(
+                            ledger_context["lineage_root_id"],
+                            ledger_context["client_turn_id"],
+                            state="recovery_required",
+                            stream_id=stream_id,
+                            current_session_id=s.session_id,
+                        )
+                        _end_client_turn_admission(ledger_context)
+                    raise
+                if ledger_context is not None:
+                    stream = create_stream_channel()
+                    register_stream_owner(stream_id, s.session_id)
+                    with STREAMS_LOCK:
+                        STREAMS[stream_id] = stream
+                    try:
+                        ledger_context["ledger"].set_admission_anchor(
+                            ledger_context["lineage_root_id"],
+                            ledger_context["client_turn_id"],
+                            phase="stream_registered",
+                        )
+                    finally:
+                        _end_client_turn_admission(ledger_context)
                 break
         if needs_stale_cleanup:
             diag.stage("stale_stream_cleanup") if diag else None
@@ -23156,9 +23771,7 @@ def _start_chat_stream_for_session(
     journal_event = {}
     try:
         from api.turn_journal import append_turn_journal_event
-        journal_event = append_turn_journal_event(
-            s.session_id,
-            {
+        _submitted_event = {
                 "event": "submitted",
                 "stream_id": stream_id,
                 "role": "user",
@@ -23168,17 +23781,22 @@ def _start_chat_stream_for_session(
                 "model": model,
                 "model_provider": model_provider,
                 "created_at": s.pending_started_at,
-            },
-        )
+            }
+        if queued_turn_id:
+            _submitted_event["turn_id"] = queued_turn_id
+        elif ledger_turn_id:
+            _submitted_event["turn_id"] = ledger_turn_id
+        journal_event = append_turn_journal_event(s.session_id, _submitted_event)
     except Exception:
         logger.warning("Failed to append submitted turn journal event", exc_info=True)
     diag.stage("set_last_workspace") if diag else None
     set_last_workspace(workspace)
     diag.stage("stream_registration") if diag else None
-    stream = create_stream_channel()
-    register_stream_owner(stream_id, s.session_id)
-    with STREAMS_LOCK:
-        STREAMS[stream_id] = stream
+    if stream is None:
+        stream = create_stream_channel()
+        register_stream_owner(stream_id, s.session_id)
+        with STREAMS_LOCK:
+            STREAMS[stream_id] = stream
     # #1932: mark stream as goal-related so the streaming hook evaluates the goal.
     if goal_related:
         STREAM_GOAL_RELATED[stream_id] = True
@@ -23199,6 +23817,14 @@ def _start_chat_stream_for_session(
     try:
         thr.start()
     except Exception:
+        if ledger_context is not None:
+            ledger_context["ledger"].transition(
+                ledger_context["lineage_root_id"],
+                ledger_context["client_turn_id"],
+                state="failed_retryable",
+                stream_id=stream_id,
+                current_session_id=s.session_id,
+            )
         if backend_is_gateway:
             try:
                 from api.gateway_chat import _finish_gateway_run_starting
@@ -23212,7 +23838,7 @@ def _start_chat_stream_for_session(
         "stream_id": stream_id,
         "session_id": s.session_id,
         "pending_started_at": s.pending_started_at,
-        "turn_id": journal_event.get("turn_id"),
+        "turn_id": ledger_turn_id or journal_event.get("turn_id"),
         "title": s.title,
     }
     if normalized_model:
@@ -23258,6 +23884,10 @@ def _chat_start_response_from_run_start(result):
     ):
         if key in payload:
             response[key] = payload[key]
+    if payload.get("status") == "queued":
+        response["status"] = "queued"
+    if "queue_limit" in payload:
+        response["queue_limit"] = payload["queue_limit"]
     response.setdefault("stream_id", result.stream_id)
     response.setdefault("session_id", result.session_id)
     return response
@@ -23290,6 +23920,7 @@ def _start_run(
     moa_config=None,
     gateway_chat_enabled: bool | None = None,
     regeneration=None,
+    client_turn_id: str | None = None,
 ):
     """Shared start-run helper for /api/chat/start and start_session_turn.
 
@@ -23334,6 +23965,7 @@ def _start_run(
                 moa_config=moa_config,
                 external_runtime_owned=gateway_chat_enabled,
                 regeneration=regeneration,
+                client_turn_id=client_turn_id,
             )
 
         def _legacy_adapter_factory():
@@ -23346,6 +23978,33 @@ def _start_run(
             )
             if adapter is None:
                 raise NotImplementedError("runtime adapter selection returned no adapter")
+            request_metadata = {"route": route, "client_turn_id": client_turn_id}
+            runner_client_turn_id = str(client_turn_id or "").strip()[:128]
+            if runtime_adapter_runner_enabled() and runner_client_turn_id:
+                request_sha256 = _client_turn_request_sha256(
+                    message=msg,
+                    attachments=attachments,
+                    workspace=workspace,
+                    model=model,
+                    model_provider=model_provider,
+                    source=source,
+                )
+                idempotency_material = "\0".join(
+                    (
+                        _client_turn_lineage_root_id(s),
+                        runner_client_turn_id,
+                        request_sha256,
+                    )
+                ).encode("utf-8")
+                request_metadata.update(
+                    {
+                        "request_sha256": request_sha256,
+                        "idempotency_key": (
+                            "client-turn:"
+                            + hashlib.sha256(idempotency_material).hexdigest()
+                        ),
+                    }
+                )
             result = adapter.start_run(
                 StartRunRequest(
                     session_id=s.session_id,
@@ -23356,7 +24015,7 @@ def _start_run(
                     provider=model_provider,
                     model=model,
                     source=source,
-                    metadata={"route": route},
+                    metadata=request_metadata,
                 )
             )
         except NotImplementedError as exc:
@@ -23376,6 +24035,7 @@ def _start_run(
         moa_config=moa_config,
         external_runtime_owned=gateway_chat_enabled,
         regeneration=regeneration,
+        client_turn_id=client_turn_id,
     )
 
 
@@ -24285,6 +24945,7 @@ def _handle_chat_start(handler, body, diag=None):
             "diag": diag,
             "gateway_chat_enabled": gateway_chat_enabled,
             "regeneration": regeneration,
+            "client_turn_id": str(body.get("client_turn_id") or "").strip()[:128] or None,
         }
         if not gateway_chat_enabled and moa_config is not None:
             start_run_kwargs["moa_config"] = moa_config
