@@ -4925,11 +4925,15 @@ def _preserve_pre_compression_snapshot(s, old_sid: str) -> None:
             saved_pending_attachments = list(getattr(s, 'pending_attachments', []) or [])
             saved_pending_started_at = getattr(s, 'pending_started_at', None)
             saved_pending_user_source = getattr(s, 'pending_user_source', None)
+            saved_queued_user_turns = copy.deepcopy(getattr(s, 'queued_user_turns', []) or [])
             s.active_stream_id = None
             s.pending_user_message = None
             s.pending_attachments = []
             s.pending_started_at = None
             s.pending_user_source = None
+            # Successor intents belong only to the live continuation. Keeping
+            # them on the archived parent creates a second durable claimant.
+            s.queued_user_turns = []
             try:
                 # skip_index=False so the snapshot appears in _index.json with
                 # the pre_compression_snapshot marker. The sidebar projection
@@ -4949,6 +4953,7 @@ def _preserve_pre_compression_snapshot(s, old_sid: str) -> None:
                 s.pending_attachments = saved_pending_attachments
                 s.pending_started_at = saved_pending_started_at
                 s.pending_user_source = saved_pending_user_source
+                s.queued_user_turns = saved_queued_user_turns
             return
         # Existing file is already at least as complete as memory; stamp only
         # the snapshot marker so index/sidebar projection can hide it without
@@ -4970,6 +4975,7 @@ def _preserve_pre_compression_snapshot(s, old_sid: str) -> None:
             snapshot.pending_attachments = []
             snapshot.pending_started_at = None
             snapshot.pending_user_source = None
+            snapshot.queued_user_turns = []
             snapshot.save(touch_updated_at=False, skip_index=False)
             logger.info(
                 "Marked pre-compression session %s as sidebar-hidden snapshot",
@@ -12875,6 +12881,17 @@ def _run_agent_streaming(
             logger.debug(
                 "turn-teardown deferred-wakeup drain failed for session %s",
                 session_id,
+                exc_info=True,
+            )
+        try:
+            from api.routes import drain_queued_user_turns_for_session
+
+            _queued_drain_sid = getattr(s, 'session_id', None) or session_id
+            drain_queued_user_turns_for_session(_queued_drain_sid)
+        except Exception:
+            logger.debug(
+                "turn-teardown queued-user-turn drain failed for session %s",
+                getattr(s, 'session_id', None) or session_id,
                 exc_info=True,
             )
 

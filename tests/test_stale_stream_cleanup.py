@@ -148,9 +148,11 @@ def test_chat_start_rechecks_active_stream_under_session_lock(monkeypatch, tmp_p
             model_provider=None,
         )
 
-        assert response["_status"] == 409
+        assert response["_status"] == 202
+        assert response["status"] == "queued"
         assert response["active_stream_id"] == existing_stream_id
         assert session.active_stream_id == existing_stream_id
+        assert [row["message"] for row in session.queued_user_turns] == ["please start once"]
         assert "new-stream" not in routes.STREAMS
     finally:
         routes.STREAMS.pop(existing_stream_id, None)
@@ -213,10 +215,12 @@ def test_chat_start_blocks_same_session_active_run_after_cancel_clears_stream_id
             model_provider=None,
         )
 
-        assert response["_status"] == 409
+        assert response["_status"] == 202
+        assert response["status"] == "queued"
         assert response["active_stream_id"] == old_stream_id
         assert session.active_stream_id is None
         assert session.pending_user_message is None
+        assert [row["message"] for row in session.queued_user_turns] == ["successor prompt"]
         assert "new-stream" not in routes.STREAMS
     finally:
         config.unregister_active_run(old_stream_id)

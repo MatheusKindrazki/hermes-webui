@@ -38,6 +38,7 @@ _METADATA_FIELDS = frozenset(
         "active_stream_id",
         "pending_user_message",
         "pending_attachments",
+        "queued_user_turns",
         "pending_started_at",
         "compression_anchor_visible_idx",
         "compression_anchor_message_key",

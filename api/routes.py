@@ -22665,6 +22665,147 @@ def _active_stream_blocks_chat_start(session, stream_id: str | None) -> bool:
     return False
 
 
+_QUEUED_USER_TURN_DRAINS = set()
+_QUEUED_USER_TURN_DRAINS_LOCK = threading.Lock()
+MAX_QUEUED_USER_TURNS = 32
+
+
+def _enqueue_queued_user_turn(
+    session,
+    *,
+    message: str,
+    attachments,
+    workspace: str,
+    model,
+    model_provider,
+    source: str,
+    client_turn_id: str | None = None,
+):
+    """Append one immutable successor intent while the current turn owns the SID."""
+    client_id = str(client_turn_id or "").strip()[:128]
+    session.queued_user_turns = list(getattr(session, "queued_user_turns", None) or [])
+    if client_id:
+        for existing in session.queued_user_turns:
+            if str(existing.get("client_turn_id") or "") == client_id:
+                return existing
+    if len(session.queued_user_turns) >= MAX_QUEUED_USER_TURNS:
+        raise OverflowError("queued user turn limit reached")
+    queued = {
+        "turn_id": f"queued-{uuid.uuid4().hex}",
+        "client_turn_id": client_id or None,
+        "message": str(message),
+        "attachments": copy.deepcopy(list(attachments or [])),
+        "workspace": str(workspace),
+        "model": model,
+        "model_provider": model_provider,
+        "source": str(source or "webui"),
+        "created_at": time.time(),
+    }
+    session.queued_user_turns.append(queued)
+    session.save(touch_updated_at=False)
+    return queued
+
+
+def _queued_chat_start_response(session, queued, active_stream_id):
+    return {
+        "status": "queued",
+        "turn_id": queued["turn_id"],
+        "session_id": session.session_id,
+        "active_stream_id": active_stream_id,
+        "_status": 202,
+    }
+
+
+def _queue_active_chat_start_locked(
+    session,
+    *,
+    active_stream_id,
+    msg,
+    attachments,
+    workspace,
+    model,
+    model_provider,
+    source,
+    client_turn_id,
+):
+    try:
+        queued = _enqueue_queued_user_turn(
+            session,
+            message=msg,
+            attachments=attachments,
+            workspace=workspace,
+            model=model,
+            model_provider=model_provider,
+            source=source,
+            client_turn_id=client_turn_id,
+        )
+    except OverflowError:
+        return {
+            "error": "Too many messages are already queued for this session.",
+            "code": "queued_turn_limit",
+            "queue_limit": MAX_QUEUED_USER_TURNS,
+            "active_stream_id": active_stream_id,
+            "_status": 429,
+        }
+    return _queued_chat_start_response(session, queued, active_stream_id)
+
+
+def drain_queued_user_turns_for_session(session_id: str) -> bool:
+    """Start at most one durable successor intent using the current lineage tip."""
+    sid = str(session_id or "").strip()
+    if not sid:
+        return False
+    with _QUEUED_USER_TURN_DRAINS_LOCK:
+        if sid in _QUEUED_USER_TURN_DRAINS:
+            return False
+        _QUEUED_USER_TURN_DRAINS.add(sid)
+    try:
+        try:
+            session = get_session(sid)
+        except KeyError:
+            return False
+        queued_turns = list(getattr(session, "queued_user_turns", None) or [])
+        if not queued_turns:
+            return False
+        if compression_recovery_payload_for_session(session):
+            changed = False
+            for item in queued_turns:
+                if isinstance(item, dict) and not item.get("recovery_required"):
+                    item["recovery_required"] = True
+                    changed = True
+            if changed:
+                session.queued_user_turns = queued_turns
+                session.save(touch_updated_at=False)
+            return False
+        if getattr(session, "active_stream_id", None) or _active_run_stream_for_session(sid):
+            return False
+        item = queued_turns[0]
+        result = _start_chat_stream_for_session(
+            session,
+            msg=str(item.get("message") or ""),
+            attachments=copy.deepcopy(item.get("attachments") or []),
+            workspace=str(item.get("workspace") or session.workspace),
+            model=item.get("model") or session.model,
+            model_provider=item.get("model_provider") or session.model_provider,
+            source=str(item.get("source") or "webui"),
+            queued_turn_id=str(item.get("turn_id") or ""),
+            client_turn_id=str(item.get("client_turn_id") or ""),
+        )
+        if result.get("stream_id") and not result.get("_status"):
+            # Test doubles and legacy delegates do not consume the durable item
+            # inside the start transaction, so close it here after acceptance.
+            session.queued_user_turns = [
+                row for row in list(getattr(session, "queued_user_turns", None) or [])
+                if row.get("turn_id") != item.get("turn_id")
+            ]
+            session.save(touch_updated_at=False)
+            return True
+        return bool(result.get("stream_id") and int(result.get("_status", 200)) < 300)
+    finally:
+        with _QUEUED_USER_TURN_DRAINS_LOCK:
+            _QUEUED_USER_TURN_DRAINS.discard(sid)
+
+
 def _start_regeneration_stream_locked(
     s,
     *,
@@ -23040,6 +23181,8 @@ def _start_chat_stream_for_session(
     moa_config=None,
     external_runtime_owned: bool | None = None,
     regeneration=None,
+    queued_turn_id: str | None = None,
+    client_turn_id: str | None = None,
 ):
     """Persist pending state, register an SSE channel, and start an agent turn."""
     if external_runtime_owned is None:
@@ -23059,12 +23202,30 @@ def _start_chat_stream_for_session(
     current_stream_id = getattr(s, "active_stream_id", None)
     if current_stream_id:
         if _active_stream_blocks_chat_start(s, current_stream_id):
-            diag.stage("response_write") if diag else None
-            return {
-                "error": "session already has an active stream",
-                "active_stream_id": current_stream_id,
-                "_status": 409,
-            }
+            if source == "webui" and regeneration is None and not queued_turn_id:
+                with _get_session_agent_lock(s.session_id):
+                    locked_stream_id = getattr(s, "active_stream_id", None)
+                    if locked_stream_id and _active_stream_blocks_chat_start(
+                        s, locked_stream_id
+                    ):
+                        return _queue_active_chat_start_locked(
+                            s,
+                            active_stream_id=locked_stream_id,
+                            msg=msg,
+                            attachments=attachments,
+                            workspace=workspace,
+                            model=model,
+                            model_provider=model_provider,
+                            source=source,
+                            client_turn_id=client_turn_id,
+                        )
+            else:
+                diag.stage("response_write") if diag else None
+                return {
+                    "error": "session already has an active stream",
+                    "active_stream_id": current_stream_id,
+                    "_status": 409,
+                }
         # Stale stream id from a previous run; clear and continue.
         diag.stage("stale_stream_cleanup") if diag else None
         _clear_stale_stream_state(s)
@@ -23091,6 +23252,18 @@ def _start_chat_stream_for_session(
             locked_stream_id = getattr(s, "active_stream_id", None)
             if locked_stream_id:
                 if _active_stream_blocks_chat_start(s, locked_stream_id):
+                    if source == "webui" and regeneration is None and not queued_turn_id:
+                        return _queue_active_chat_start_locked(
+                            s,
+                            active_stream_id=locked_stream_id,
+                            msg=msg,
+                            attachments=attachments,
+                            workspace=workspace,
+                            model=model,
+                            model_provider=model_provider,
+                            source=source,
+                            client_turn_id=client_turn_id,
+                        )
                     diag.stage("response_write") if diag else None
                     return {
                         "error": "session already has an active stream",
@@ -23101,6 +23274,18 @@ def _start_chat_stream_for_session(
             else:
                 blocking_run_stream_id = _active_run_stream_for_session(s.session_id)
                 if blocking_run_stream_id:
+                    if source == "webui" and regeneration is None and not queued_turn_id:
+                        return _queue_active_chat_start_locked(
+                            s,
+                            active_stream_id=blocking_run_stream_id,
+                            msg=msg,
+                            attachments=attachments,
+                            workspace=workspace,
+                            model=model,
+                            model_provider=model_provider,
+                            source=source,
+                            client_turn_id=client_turn_id,
+                        )
                     diag.stage("response_write") if diag else None
                     return {
                         "error": "session already has an active stream",
@@ -23123,6 +23308,11 @@ def _start_chat_stream_for_session(
                         backend_is_gateway=backend_is_gateway,
                     )
                 stream_id = uuid.uuid4().hex
+                if queued_turn_id:
+                    s.queued_user_turns = [
+                        row for row in list(getattr(s, "queued_user_turns", None) or [])
+                        if str(row.get("turn_id") or "") != queued_turn_id
+                    ]
                 diag.stage("save_pending_state") if diag else None
                 was_hidden_empty_session = _is_hidden_empty_session(s)
                 _prepare_chat_start_session_for_stream(
@@ -23156,9 +23346,7 @@ def _start_chat_stream_for_session(
     journal_event = {}
     try:
         from api.turn_journal import append_turn_journal_event
-        journal_event = append_turn_journal_event(
-            s.session_id,
-            {
+        _submitted_event = {
                 "event": "submitted",
                 "stream_id": stream_id,
                 "role": "user",
@@ -23168,8 +23356,10 @@ def _start_chat_stream_for_session(
                 "model": model,
                 "model_provider": model_provider,
                 "created_at": s.pending_started_at,
-            },
-        )
+            }
+        if queued_turn_id:
+            _submitted_event["turn_id"] = queued_turn_id
+        journal_event = append_turn_journal_event(s.session_id, _submitted_event)
     except Exception:
         logger.warning("Failed to append submitted turn journal event", exc_info=True)
     diag.stage("set_last_workspace") if diag else None
@@ -23258,6 +23448,10 @@ def _chat_start_response_from_run_start(result):
     ):
         if key in payload:
             response[key] = payload[key]
+    if payload.get("status") == "queued":
+        response["status"] = "queued"
+    if "queue_limit" in payload:
+        response["queue_limit"] = payload["queue_limit"]
     response.setdefault("stream_id", result.stream_id)
     response.setdefault("session_id", result.session_id)
     return response
@@ -23290,6 +23484,7 @@ def _start_run(
     moa_config=None,
     gateway_chat_enabled: bool | None = None,
     regeneration=None,
+    client_turn_id: str | None = None,
 ):
     """Shared start-run helper for /api/chat/start and start_session_turn.
 
@@ -23334,6 +23529,7 @@ def _start_run(
                 moa_config=moa_config,
                 external_runtime_owned=gateway_chat_enabled,
                 regeneration=regeneration,
+                client_turn_id=client_turn_id,
             )
 
         def _legacy_adapter_factory():
@@ -23356,7 +23552,7 @@ def _start_run(
                     provider=model_provider,
                     model=model,
                     source=source,
-                    metadata={"route": route},
+                    metadata={"route": route, "client_turn_id": client_turn_id},
                 )
             )
         except NotImplementedError as exc:
@@ -23376,6 +23572,7 @@ def _start_run(
         moa_config=moa_config,
         external_runtime_owned=gateway_chat_enabled,
         regeneration=regeneration,
+        client_turn_id=client_turn_id,
     )
 
 
@@ -24285,6 +24482,7 @@ def _handle_chat_start(handler, body, diag=None):
             "diag": diag,
             "gateway_chat_enabled": gateway_chat_enabled,
             "regeneration": regeneration,
+            "client_turn_id": str(body.get("client_turn_id") or "").strip()[:128] or None,
         }
         if not gateway_chat_enabled and moa_config is not None:
             start_run_kwargs["moa_config"] = moa_config
