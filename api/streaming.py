@@ -2672,6 +2672,69 @@ def _request_context_v2_enabled() -> bool:
     }
 
 
+class RequestContextV2MCPIsolationError(RuntimeError):
+    """The installed agent cannot isolate MCP connections by profile home."""
+
+
+def _discover_mcp_tools_for_request_context_v2(
+    *,
+    profile_home,
+    config_data: dict | None = None,
+    mcp_module=None,
+):
+    """Discover only through an explicit profile-keyed MCP registry contract.
+
+    The legacy ``tools.mcp_tool.discover_mcp_tools()`` registry is keyed only by
+    server name. Calling it from concurrent profile turns can therefore reuse
+    another profile's command or credentials. Until the installed agent exposes
+    the explicit capability below, an enabled MCP config fails closed before the
+    conversation is handed to the agent.
+    """
+    profile_home_text = str(Path(profile_home).expanduser())
+    if config_data is None:
+        from api.config import get_config_for_profile_home
+
+        config_data = get_config_for_profile_home(profile_home_text)
+    raw_servers = (
+        config_data.get("mcp_servers", {})
+        if isinstance(config_data, dict)
+        else {}
+    )
+    if not isinstance(raw_servers, dict):
+        raw_servers = {}
+    enabled_servers = {
+        str(name): copy.deepcopy(spec)
+        for name, spec in raw_servers.items()
+        if isinstance(spec, dict) and spec.get("enabled", True) is not False
+    }
+    if not enabled_servers:
+        return []
+
+    if mcp_module is None:
+        try:
+            from tools import mcp_tool as mcp_module
+        except Exception as exc:
+            raise RequestContextV2MCPIsolationError(
+                "request context v2 requires a profile-scoped MCP registry"
+            ) from exc
+    discover_for_profile = getattr(
+        mcp_module,
+        "discover_mcp_tools_for_profile",
+        None,
+    )
+    if not (
+        getattr(mcp_module, "PROFILE_SCOPED_MCP_REGISTRY", False)
+        and callable(discover_for_profile)
+    ):
+        raise RequestContextV2MCPIsolationError(
+            "request context v2 requires a profile-scoped MCP registry"
+        )
+    return discover_for_profile(
+        profile_home=profile_home_text,
+        servers=enabled_servers,
+    )
+
+
 def _install_request_context_v2(
     *,
     thread_env: dict,
@@ -9576,11 +9639,16 @@ def _run_agent_streaming(
         # `_servers` by `(profile_home, name)` upstream in hermes-agent; that
         # lives outside this WebUI repo.  This change fixes the headline bug
         # for users who run a single non-default profile per WebUI process.
-        try:
-            from tools.mcp_tool import discover_mcp_tools
-            discover_mcp_tools()
-        except Exception:
-            pass  # MCP not available or not configured — non-fatal
+        if _request_context_v2:
+            _discover_mcp_tools_for_request_context_v2(
+                profile_home=_profile_home,
+            )
+        else:
+            try:
+                from tools.mcp_tool import discover_mcp_tools
+                discover_mcp_tools()
+            except Exception:
+                pass  # MCP not available or not configured — non-fatal
 
         # Register a gateway-style notify callback so the approval system can
         # push the `approval` SSE event the moment a dangerous command is
