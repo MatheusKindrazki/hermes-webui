@@ -44,6 +44,9 @@ class HttpRunnerClient:
                 f"runner base_url must be http(s); got scheme '{_scheme or '(none)'}'"
             )
         self.api_key = str(api_key or "").strip()
+        # Transport handles only: lifecycle truth remains runner-owned. Each
+        # observe call pumps one frame from the same open SSE response.
+        self._sse_streams: dict[str, dict[str, Any]] = {}
 
     @classmethod
     def from_env(cls, environ: dict[str, str] | None = None) -> "HttpRunnerClient":
@@ -188,60 +191,96 @@ class HttpRunnerClient:
         run_id: str,
         cursor: str | None,
     ) -> dict[str, Any]:
-        """Consume Agent's native run SSE stream into the adapter envelope."""
-        try:
-            with self._opener().open(req, timeout=60) as resp:
-                lines = list(resp)
-        except urllib.error.HTTPError as exc:
+        """Pump one Agent SSE event without buffering the response to EOF."""
+        state = self._sse_streams.get(run_id)
+        if state is None:
             try:
-                detail = exc.read(2048).decode("utf-8", errors="replace")
-            except Exception:
-                detail = ""
-            raise RunnerClientError(f"Runner returned HTTP {exc.code}: {detail[:500]}") from exc
-        except Exception as exc:
-            raise RunnerClientError(f"Runner request failed: {exc}") from exc
+                response = self._opener().open(req, timeout=60)
+            except urllib.error.HTTPError as exc:
+                try:
+                    detail = exc.read(2048).decode("utf-8", errors="replace")
+                except Exception:
+                    detail = ""
+                raise RunnerClientError(
+                    f"Runner returned HTTP {exc.code}: {detail[:500]}"
+                ) from exc
+            except Exception as exc:
+                raise RunnerClientError(f"Runner request failed: {exc}") from exc
+            try:
+                seq = int(str(cursor or "0").rsplit(":", 1)[-1])
+            except (TypeError, ValueError):
+                seq = 0
+            state = {
+                "response": response,
+                "iterator": iter(response),
+                "data_lines": [],
+                "wire_event": None,
+                "wire_id": None,
+                "seq": max(0, seq),
+            }
+            self._sse_streams[run_id] = state
 
         events: list[dict[str, Any]] = []
-        data_lines: list[str] = []
-        wire_event: str | None = None
-        wire_id: str | None = None
+        terminal_names = {
+            "run.cancelled",
+            "run.completed",
+            "run.failed",
+            "stream_end",
+        }
 
-        def flush() -> None:
-            nonlocal data_lines, wire_event, wire_id
-            if not data_lines:
-                wire_event = None
-                wire_id = None
-                return
-            raw = "\n".join(data_lines)
-            data_lines = []
+        def close_stream() -> None:
+            if self._sse_streams.get(run_id) is state:
+                self._sse_streams.pop(run_id, None)
+            close = getattr(state["response"], "close", None)
+            if callable(close):
+                close()
+
+        while not events:
             try:
-                payload = json.loads(raw)
-            except json.JSONDecodeError as exc:
-                raise RunnerClientError("Runner returned invalid SSE JSON") from exc
-            if not isinstance(payload, dict):
-                raise RunnerClientError("Runner returned a non-object SSE event")
-            if wire_event and not payload.get("event"):
-                payload["event"] = wire_event
-            if wire_id and not payload.get("event_id"):
-                payload["event_id"] = wire_id
-            payload.setdefault("seq", len(events) + 1)
-            events.append(payload)
-            wire_event = None
-            wire_id = None
+                raw_line = next(state["iterator"])
+            except StopIteration:
+                close_stream()
+                break
+            except Exception as exc:
+                close_stream()
+                raise RunnerClientError(f"Runner SSE read failed: {exc}") from exc
 
-        for raw_line in lines:
             line = raw_line.decode("utf-8", errors="replace").rstrip("\r\n")
             if not line:
-                flush()
+                data_lines = state["data_lines"]
+                if not data_lines:
+                    state["wire_event"] = None
+                    state["wire_id"] = None
+                    continue
+                raw = "\n".join(data_lines)
+                state["data_lines"] = []
+                try:
+                    payload = json.loads(raw)
+                except json.JSONDecodeError as exc:
+                    close_stream()
+                    raise RunnerClientError("Runner returned invalid SSE JSON") from exc
+                if not isinstance(payload, dict):
+                    close_stream()
+                    raise RunnerClientError("Runner returned a non-object SSE event")
+                if state["wire_event"] and not payload.get("event"):
+                    payload["event"] = state["wire_event"]
+                if state["wire_id"] and not payload.get("event_id"):
+                    payload["event_id"] = state["wire_id"]
+                state["seq"] += 1
+                payload.setdefault("seq", state["seq"])
+                events.append(payload)
+                state["wire_event"] = None
+                state["wire_id"] = None
+                if payload.get("event") in terminal_names:
+                    close_stream()
             elif line.startswith(":"):
                 continue
             elif line.startswith("data:"):
-                data_lines.append(line[5:].lstrip(" "))
+                state["data_lines"].append(line[5:].lstrip(" "))
             elif line.startswith("event:"):
-                wire_event = line[6:].strip()
+                state["wire_event"] = line[6:].strip()
             elif line.startswith("id:"):
-                wire_id = line[3:].strip()
-        flush()
+                state["wire_id"] = line[3:].strip()
 
         next_cursor = str(events[-1]["seq"]) if events else cursor
         last_event_id = events[-1].get("event_id") if events else None

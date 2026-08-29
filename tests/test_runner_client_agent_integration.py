@@ -1,6 +1,6 @@
 """Real HTTP contract proof between WebUI and Hermes Agent's run receiver."""
 
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
 from contextlib import contextmanager
 import os
 from pathlib import Path
@@ -127,15 +127,31 @@ def test_http_runner_client_real_start_observe_message_clarify_and_cancel():
         else:
             pytest.fail("Agent run did not reach running")
 
-        with ThreadPoolExecutor(max_workers=1) as pool:
-            observed = pool.submit(client.observe_run, run_id)
-            assert client.queue_message(run_id, "follow-up", mode="interrupt")["accepted"] is True
-            assert client.respond_clarify(run_id, "clarify-1", "the answer")["accepted"] is True
-            cancelled = client.cancel_run(run_id)
-            stream = observed.result(timeout=10)
+        pool = ThreadPoolExecutor(max_workers=1)
+        observed = pool.submit(client.observe_run, run_id)
+        try:
+            first_stream = observed.result(timeout=3)
+        except FutureTimeout:
+            # Cleanup only after the latency assertion has already failed.
+            client.cancel_run(run_id)
+            observed.result(timeout=10)
+            pytest.fail("observe_run buffered SSE until terminal EOF")
+
+        first_names = [event.get("event") for event in first_stream["events"]]
+        assert "tool.started" in first_names
+        assert client.get_run(run_id)["status"] == "running"
+
+        assert client.queue_message(run_id, "follow-up", mode="interrupt")["accepted"] is True
+        assert client.respond_clarify(run_id, "clarify-1", "the answer")["accepted"] is True
+        cancelled = client.cancel_run(run_id)
+
+        names = list(first_names)
+        deadline = time.monotonic() + 10
+        while "run.cancelled" not in names and time.monotonic() < deadline:
+            stream = client.observe_run(run_id)
+            names.extend(event.get("event") for event in stream["events"])
+        pool.shutdown(wait=True)
 
         assert cancelled["status"] == "stopping"
-        names = [event.get("event") for event in stream["events"]]
-        assert "tool.started" in names
         assert names.count("run.steered") == 2
         assert "run.cancelled" in names
