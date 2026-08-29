@@ -2663,13 +2663,21 @@ def _build_agent_thread_env(profile_runtime_env: dict | None, workspace: str, se
     return env
 
 
-def _request_context_v2_enabled() -> bool:
-    return str(os.getenv("HERMES_REQUEST_CONTEXT_V2", "0") or "0").strip().lower() in {
-        "1",
-        "true",
-        "yes",
-        "on",
-    }
+def _request_context_v2_enabled(
+    *,
+    session=None,
+    profile_home=None,
+    config_data: dict | None = None,
+) -> bool:
+    from api.reliability_flags import reliability_feature_enabled
+
+    return reliability_feature_enabled(
+        "HERMES_REQUEST_CONTEXT_V2",
+        "request_context_v2",
+        session=session,
+        profile_home=profile_home,
+        config_data=config_data,
+    )
 
 
 class RequestContextV2MCPIsolationError(RuntimeError):
@@ -2741,9 +2749,14 @@ def _install_request_context_v2(
     session_id: str,
     workspace: str,
     profile: str | None,
+    authorized: bool | None = None,
 ) -> dict:
     """Bind all per-turn identity without mutating process-global env."""
-    if not _request_context_v2_enabled():
+    if authorized is None:
+        authorized = _request_context_v2_enabled(
+            profile_home=(thread_env or {}).get("HERMES_HOME"),
+        )
+    if not authorized:
         raise RuntimeError("HERMES_REQUEST_CONTEXT_V2 is not enabled")
     from api.config import _thread_ctx
 
@@ -8870,11 +8883,11 @@ def _settle_client_turn_ledger(
     *,
     current_session_id: str | None = None,
 ):
-    """Persist a stream's terminal state when the default-off ledger is active."""
-    enabled = str(os.getenv("HERMES_TURN_LEDGER_ENABLED", "0") or "0").strip().lower()
-    if enabled not in {"1", "true", "yes", "on"}:
+    """Persist terminal state for any row admitted before a switch change."""
+    from api.client_turn_ledger import _default_db_path, default_client_turn_ledger
+
+    if not _default_db_path().exists():
         return None
-    from api.client_turn_ledger import default_client_turn_ledger
 
     return default_client_turn_ledger().transition_by_stream(
         stream_id,
@@ -8884,11 +8897,11 @@ def _settle_client_turn_ledger(
 
 
 def _rotate_client_turn_ledger_session(old_session_id: str, new_session_id: str) -> int:
-    """Transfer live ledger ownership when compression rotates the WebUI SID."""
-    enabled = str(os.getenv("HERMES_TURN_LEDGER_ENABLED", "0") or "0").strip().lower()
-    if enabled not in {"1", "true", "yes", "on"}:
+    """Transfer already-admitted rows even after the global switch is killed."""
+    from api.client_turn_ledger import _default_db_path, default_client_turn_ledger
+
+    if not _default_db_path().exists():
         return 0
-    from api.client_turn_ledger import default_client_turn_ledger
 
     return default_client_turn_ledger().rotate_live_session(
         old_session_id, new_session_id
@@ -9383,7 +9396,7 @@ def _run_agent_streaming(
     _streaming_skill_home_snapshot = None
     _restore_streaming_skill_home_modules = False
     _acquired_streaming_skill_home_patch_lock = False
-    _request_context_v2 = _request_context_v2_enabled()
+    _request_context_v2 = False
     _request_context_v2_ctx = None
     _process_env_mirror_applied = False
     # Initialised here (before any code that may raise) so the outer `finally`
@@ -9398,6 +9411,19 @@ def _run_agent_streaming(
         # end_session()/_metering_stop.set() teardown is always paired (#4633/#2476).
         meter().begin_session(stream_id)
         _metering_thread.start()
+        s = get_session(session_id)
+        try:
+            from api.profiles import get_hermes_home_for_profile as _flag_profile_home
+
+            _request_context_v2_profile_home = _flag_profile_home(
+                getattr(s, 'profile', None)
+            )
+        except Exception:
+            _request_context_v2_profile_home = None
+        _request_context_v2 = _request_context_v2_enabled(
+            session=s,
+            profile_home=_request_context_v2_profile_home,
+        )
         # Bind THIS turn's session identity to the worker thread/context BEFORE
         # any agent work (so every mid-turn notify_on_complete background spawn
         # captures THIS session, not a concurrent turn's process-global env).
@@ -9405,7 +9431,6 @@ def _run_agent_streaming(
         # in the outer finally next to _clear_thread_env().
         if not _request_context_v2:
             _turn_session_identity_tokens = _set_turn_session_identity(session_id)
-        s = get_session(session_id)
         _turn_pending_source = getattr(s, 'pending_user_source', None) or 'webui'
         _active_turn_identity = _active_turn_authority(s, stream_id, msg_text)
         update_active_run(stream_id, phase="running", session_id=session_id)
@@ -9531,6 +9556,7 @@ def _run_agent_streaming(
                 session_id=session_id,
                 workspace=str(s.workspace),
                 profile=_resolved_profile_name,
+                authorized=True,
             )
         else:
             _streaming_hermes_home_override_ctx = _set_streaming_hermes_home_override(

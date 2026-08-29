@@ -22721,13 +22721,14 @@ def _client_turn_failpoint(context, name: str) -> None:
     raise ClientTurnAdmissionCrash(name)
 
 
-def _client_turn_ledger_enabled() -> bool:
-    return str(os.getenv("HERMES_TURN_LEDGER_ENABLED", "0") or "0").strip().lower() in {
-        "1",
-        "true",
-        "yes",
-        "on",
-    }
+def _client_turn_ledger_enabled(session=None) -> bool:
+    from api.reliability_flags import reliability_feature_enabled
+
+    return reliability_feature_enabled(
+        "HERMES_TURN_LEDGER_ENABLED",
+        "turn_ledger",
+        session=session,
+    )
 
 
 def _client_turn_lineage_root_id(session) -> str:
@@ -22786,7 +22787,7 @@ def _client_turn_ledger_context(
     source,
 ):
     client_id = str(client_turn_id or "").strip()[:128]
-    if not client_id or not _client_turn_ledger_enabled():
+    if not client_id or not _client_turn_ledger_enabled(session):
         return None
     from api.client_turn_ledger import default_client_turn_ledger
 
