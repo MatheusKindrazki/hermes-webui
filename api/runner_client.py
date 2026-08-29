@@ -84,13 +84,17 @@ class HttpRunnerClient:
         query = ""
         if cursor not in (None, ""):
             query = "?cursor=" + urllib.parse.quote(str(cursor), safe="")
-        return self._get(f"/v1/runs/{urllib.parse.quote(str(run_id), safe='')}/events{query}")
+        path = f"/v1/runs/{urllib.parse.quote(str(run_id), safe='')}/events{query}"
+        headers = self._headers()
+        headers["Accept"] = "text/event-stream"
+        req = urllib.request.Request(self.base_url + path, headers=headers, method="GET")
+        return self._request_sse(req, run_id=str(run_id), cursor=cursor)
 
     def get_run(self, run_id: str) -> dict[str, Any]:
         return self._get(f"/v1/runs/{urllib.parse.quote(str(run_id), safe='')}")
 
     def cancel_run(self, run_id: str) -> dict[str, Any]:
-        return self._post(f"/v1/runs/{urllib.parse.quote(str(run_id), safe='')}/cancel", {})
+        return self._post(f"/v1/runs/{urllib.parse.quote(str(run_id), safe='')}/stop", {})
 
     def respond_approval(self, run_id: str, approval_id: str, choice: str) -> dict[str, Any]:
         return self._post(
@@ -100,13 +104,13 @@ class HttpRunnerClient:
 
     def respond_clarify(self, run_id: str, clarify_id: str, response: str) -> dict[str, Any]:
         return self._post(
-            f"/v1/runs/{urllib.parse.quote(str(run_id), safe='')}/clarifications/{urllib.parse.quote(str(clarify_id), safe='')}/respond",
-            {"response": response},
+            f"/v1/runs/{urllib.parse.quote(str(run_id), safe='')}/steer",
+            {"message": response, "clarify_id": clarify_id},
         )
 
     def queue_message(self, run_id: str, message: str, *, mode: str = "queue") -> dict[str, Any]:
         return self._post(
-            f"/v1/runs/{urllib.parse.quote(str(run_id), safe='')}/messages",
+            f"/v1/runs/{urllib.parse.quote(str(run_id), safe='')}/steer",
             {"message": message, "mode": mode},
         )
 
@@ -176,3 +180,74 @@ class HttpRunnerClient:
         if not isinstance(payload, dict):
             raise RunnerClientError("Runner returned a non-object JSON payload")
         return payload
+
+    def _request_sse(
+        self,
+        req: urllib.request.Request,
+        *,
+        run_id: str,
+        cursor: str | None,
+    ) -> dict[str, Any]:
+        """Consume Agent's native run SSE stream into the adapter envelope."""
+        try:
+            with self._opener().open(req, timeout=60) as resp:
+                lines = list(resp)
+        except urllib.error.HTTPError as exc:
+            try:
+                detail = exc.read(2048).decode("utf-8", errors="replace")
+            except Exception:
+                detail = ""
+            raise RunnerClientError(f"Runner returned HTTP {exc.code}: {detail[:500]}") from exc
+        except Exception as exc:
+            raise RunnerClientError(f"Runner request failed: {exc}") from exc
+
+        events: list[dict[str, Any]] = []
+        data_lines: list[str] = []
+        wire_event: str | None = None
+        wire_id: str | None = None
+
+        def flush() -> None:
+            nonlocal data_lines, wire_event, wire_id
+            if not data_lines:
+                wire_event = None
+                wire_id = None
+                return
+            raw = "\n".join(data_lines)
+            data_lines = []
+            try:
+                payload = json.loads(raw)
+            except json.JSONDecodeError as exc:
+                raise RunnerClientError("Runner returned invalid SSE JSON") from exc
+            if not isinstance(payload, dict):
+                raise RunnerClientError("Runner returned a non-object SSE event")
+            if wire_event and not payload.get("event"):
+                payload["event"] = wire_event
+            if wire_id and not payload.get("event_id"):
+                payload["event_id"] = wire_id
+            payload.setdefault("seq", len(events) + 1)
+            events.append(payload)
+            wire_event = None
+            wire_id = None
+
+        for raw_line in lines:
+            line = raw_line.decode("utf-8", errors="replace").rstrip("\r\n")
+            if not line:
+                flush()
+            elif line.startswith(":"):
+                continue
+            elif line.startswith("data:"):
+                data_lines.append(line[5:].lstrip(" "))
+            elif line.startswith("event:"):
+                wire_event = line[6:].strip()
+            elif line.startswith("id:"):
+                wire_id = line[3:].strip()
+        flush()
+
+        next_cursor = str(events[-1]["seq"]) if events else cursor
+        last_event_id = events[-1].get("event_id") if events else None
+        return {
+            "run_id": run_id,
+            "events": events,
+            "cursor": next_cursor,
+            "last_event_id": last_event_id,
+        }

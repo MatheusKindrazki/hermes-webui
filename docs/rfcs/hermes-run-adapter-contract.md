@@ -976,6 +976,15 @@ names/payloads, or a later runner-owned normalization layer must translate
 Hermes runtime families such as `token.delta`, `tool.started`, and `done` before
 they reach this route.
 
+The Hermes Agent compatibility profile uses Agent's native lifecycle endpoints:
+`POST /v1/runs` starts, `GET /v1/runs/{id}/events` is consumed as SSE,
+`POST /v1/runs/{id}/stop` cancels, and both queued follow-up text and
+clarification answers use `POST /v1/runs/{id}/steer`. WebUI normalizes the SSE
+frames into `RunEventStream`; it does not require a parallel JSON snapshot route
+or add WebUI-owned lifecycle state. This mapping remains default-off with the
+runner client and is covered by a real HTTP start-observe-steer-cancel contract
+test against `APIServerAdapter`.
+
 After the configured runner-client boundary ships, the next reviewable step is
 not to make `runner-local` the default. It is to define the first supervised
 runner process harness that can actually own `AIAgent` execution behind that

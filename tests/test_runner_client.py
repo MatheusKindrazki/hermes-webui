@@ -20,6 +20,10 @@ class FakeResponse:
     def read(self):
         return json.dumps(self.payload).encode("utf-8")
 
+    def __iter__(self):
+        yield b"data: " + self.read() + b"\n"
+        yield b"\n"
+
 
 class _FakeOpener:
     """Stand-in for the no-redirect opener: routes .open() to a fake urlopen."""
@@ -117,10 +121,10 @@ def test_runner_client_maps_observe_status_and_controls(monkeypatch):
     assert calls == [
         ("GET", "http://runner.local/v1/runs/run%2F1/events?cursor=event%3A2", None),
         ("GET", "http://runner.local/v1/runs/run%2F1", None),
-        ("POST", "http://runner.local/v1/runs/run%2F1/cancel", {}),
+        ("POST", "http://runner.local/v1/runs/run%2F1/stop", {}),
         ("POST", "http://runner.local/v1/runs/run%2F1/approval", {"choice": "once", "approval_id": "approval/1"}),
-        ("POST", "http://runner.local/v1/runs/run%2F1/clarifications/clarify%2F1/respond", {"response": "answer"}),
-        ("POST", "http://runner.local/v1/runs/run%2F1/messages", {"message": "next", "mode": "interrupt"}),
+        ("POST", "http://runner.local/v1/runs/run%2F1/steer", {"message": "answer", "clarify_id": "clarify/1"}),
+        ("POST", "http://runner.local/v1/runs/run%2F1/steer", {"message": "next", "mode": "interrupt"}),
         ("POST", "http://runner.local/v1/sessions/session%2F1/goal", {"action": "set", "text": "finish"}),
     ]
 
