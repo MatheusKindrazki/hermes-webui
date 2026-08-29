@@ -2663,6 +2663,141 @@ def _build_agent_thread_env(profile_runtime_env: dict | None, workspace: str, se
     return env
 
 
+def _request_context_v2_enabled() -> bool:
+    return str(os.getenv("HERMES_REQUEST_CONTEXT_V2", "0") or "0").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def _install_request_context_v2(
+    *,
+    thread_env: dict,
+    session_id: str,
+    workspace: str,
+    profile: str | None,
+) -> dict:
+    """Bind all per-turn identity without mutating process-global env."""
+    if not _request_context_v2_enabled():
+        raise RuntimeError("HERMES_REQUEST_CONTEXT_V2 is not enabled")
+    from api.config import _thread_ctx
+
+    context = {
+        "previous_thread_env": dict(getattr(_thread_ctx, "env", {}) or {}),
+        "previous_block_process_env": bool(
+            getattr(_thread_ctx, "block_process_env_fallback", False)
+        ),
+        "secret_scope_mod": None,
+        "secret_scope_token": None,
+        "home_override": (None, None, False),
+        "session_context_mod": None,
+        "session_context_tokens": None,
+        "approval_mod": None,
+        "approval_token": None,
+    }
+    try:
+        scoped_env = dict(thread_env or {})
+        profile_home = str(scoped_env.get("HERMES_HOME") or "").strip()
+        if not profile_home:
+            raise RuntimeError("request context v2 requires HERMES_HOME")
+        _set_thread_env(**scoped_env)
+        _thread_ctx.block_process_env_fallback = True
+
+        from agent import secret_scope as secret_scope_mod
+
+        if not all(
+            hasattr(secret_scope_mod, name)
+            for name in ("set_secret_scope", "reset_secret_scope")
+        ):
+            raise RuntimeError("request context v2 requires agent.secret_scope")
+        context["secret_scope_mod"] = secret_scope_mod
+        context["secret_scope_token"] = secret_scope_mod.set_secret_scope(scoped_env)
+
+        home_override = _set_streaming_hermes_home_override(profile_home)
+        if not home_override[2]:
+            raise RuntimeError("request context v2 requires Hermes-home context support")
+        context["home_override"] = home_override
+
+        from gateway import session_context as session_context_mod
+
+        if not all(
+            hasattr(session_context_mod, name)
+            for name in ("set_session_vars", "clear_session_vars")
+        ):
+            raise RuntimeError("request context v2 requires gateway session context")
+        context["session_context_mod"] = session_context_mod
+        context["session_context_tokens"] = session_context_mod.set_session_vars(
+            platform="webui",
+            source="webui",
+            chat_id=str(session_id),
+            session_key=str(session_id),
+            session_id=str(session_id),
+            profile=str(profile or "default"),
+            cwd=str(workspace),
+            ui_session_id=str(session_id),
+            async_delivery=True,
+        )
+
+        from tools import approval as approval_mod
+
+        if not all(
+            hasattr(approval_mod, name)
+            for name in ("set_current_session_key", "reset_current_session_key")
+        ):
+            raise RuntimeError("request context v2 requires approval session context")
+        context["approval_mod"] = approval_mod
+        context["approval_token"] = approval_mod.set_current_session_key(
+            str(session_id)
+        )
+        return context
+    except Exception:
+        _reset_request_context_v2(context)
+        raise
+
+
+def _reset_request_context_v2(context: dict | None) -> None:
+    """Release v2 bindings in reverse order and restore prior thread state."""
+    if not context:
+        return
+    approval_mod = context.get("approval_mod")
+    approval_token = context.get("approval_token")
+    if approval_mod is not None and approval_token is not None:
+        try:
+            approval_mod.reset_current_session_key(approval_token)
+        except Exception:
+            logger.debug("Failed to reset v2 approval context", exc_info=True)
+    session_context_mod = context.get("session_context_mod")
+    session_context_tokens = context.get("session_context_tokens")
+    if session_context_mod is not None and session_context_tokens is not None:
+        try:
+            session_context_mod.clear_session_vars(session_context_tokens)
+        except Exception:
+            logger.debug("Failed to clear v2 session context", exc_info=True)
+    _reset_streaming_hermes_home_override(*context.get("home_override", (None, None, False)))
+    secret_scope_mod = context.get("secret_scope_mod")
+    secret_scope_token = context.get("secret_scope_token")
+    if secret_scope_mod is not None and secret_scope_token is not None:
+        try:
+            secret_scope_mod.reset_secret_scope(secret_scope_token)
+        except Exception:
+            logger.debug("Failed to reset v2 secret scope", exc_info=True)
+    try:
+        from api.config import _thread_ctx
+
+        _thread_ctx.block_process_env_fallback = bool(
+            context.get("previous_block_process_env", False)
+        )
+        previous_thread_env = dict(context.get("previous_thread_env") or {})
+        if previous_thread_env:
+            _set_thread_env(**previous_thread_env)
+        else:
+            _clear_thread_env()
+    except Exception:
+        logger.debug("Failed to restore v2 thread env", exc_info=True)
+
+
 _streaming_hermes_home_override_available = None
 
 
@@ -9185,6 +9320,9 @@ def _run_agent_streaming(
     _streaming_skill_home_snapshot = None
     _restore_streaming_skill_home_modules = False
     _acquired_streaming_skill_home_patch_lock = False
+    _request_context_v2 = _request_context_v2_enabled()
+    _request_context_v2_ctx = None
+    _process_env_mirror_applied = False
     # Initialised here (before any code that may raise) so the outer `finally`
     # block can safely check `if _checkpoint_stop is not None` even when an
     # exception fires before the checkpoint thread is created (Issue #765).
@@ -9202,7 +9340,8 @@ def _run_agent_streaming(
         # captures THIS session, not a concurrent turn's process-global env).
         # Co-located with the existing env-restore lifecycle: set here, reset
         # in the outer finally next to _clear_thread_env().
-        _turn_session_identity_tokens = _set_turn_session_identity(session_id)
+        if not _request_context_v2:
+            _turn_session_identity_tokens = _set_turn_session_identity(session_id)
         s = get_session(session_id)
         _turn_pending_source = getattr(s, 'pending_user_source', None) or 'webui'
         _active_turn_identity = _active_turn_authority(s, stream_id, msg_text)
@@ -9323,8 +9462,18 @@ def _run_agent_streaming(
             session_id,
             _profile_home,
         )
-        _streaming_hermes_home_override_ctx = _set_streaming_hermes_home_override(_profile_home)
-        _set_thread_env(**_thread_env)
+        if _request_context_v2:
+            _request_context_v2_ctx = _install_request_context_v2(
+                thread_env=_thread_env,
+                session_id=session_id,
+                workspace=str(s.workspace),
+                profile=_resolved_profile_name,
+            )
+        else:
+            _streaming_hermes_home_override_ctx = _set_streaming_hermes_home_override(
+                _profile_home
+            )
+            _set_thread_env(**_thread_env)
         # process_complete agent-wakeup wiring (ours-original, Option B): bind
         # this session's HERMES_SESSION_KEY to its WebUI session_id so the
         # drain thread can route notify_on_complete events back to the right
@@ -9343,7 +9492,14 @@ def _run_agent_streaming(
         # Full-turn serialization is only needed for static/legacy skill-module
         # resolution, where process-global skill-module globals are still used.
         # Dynamic-capable modules continue concurrent execution.
-        _streaming_override_installed = bool(_streaming_hermes_home_override_ctx[2])
+        if _request_context_v2:
+            _streaming_override_installed = bool(
+                (_request_context_v2_ctx or {}).get(
+                    "home_override", (None, None, False)
+                )[2]
+            )
+        else:
+            _streaming_override_installed = bool(_streaming_hermes_home_override_ctx[2])
         _streaming_modules_are_dynamic = False
         if patch_skill_home_modules is not None and snapshot_skill_home_modules is not None:
             if _streaming_override_installed and _skill_modules_support_profile_home is not None:
@@ -9359,55 +9515,58 @@ def _run_agent_streaming(
                     )
                     _streaming_modules_are_dynamic = False
 
-            if not (_streaming_override_installed and _streaming_modules_are_dynamic):
+            if _request_context_v2 and not (
+                _streaming_override_installed and _streaming_modules_are_dynamic
+            ):
+                raise RuntimeError(
+                    "request context v2 requires dynamic profile-aware skill modules"
+                )
+            if not _request_context_v2 and not (
+                _streaming_override_installed and _streaming_modules_are_dynamic
+            ):
                 _restore_streaming_skill_home_modules = True
                 _SKILL_HOME_MODULE_PATCH_LOCK.acquire()
                 _acquired_streaming_skill_home_patch_lock = True
 
-        # Still set process-level env as fallback for tools that bypass thread-local
+        # Legacy mode still mirrors process env for readers that bypass thread-local
         # Acquire lock only for the env mutation, then release before the agent runs.
         # The finally block re-acquires to restore — keeping critical sections short
         # and preventing a deadlock where the restore would re-enter the same lock.
-        with _ENV_LOCK:
-            if _restore_streaming_skill_home_modules:
-                # Snapshot and patch before mutating process env so setup
-                # failures can unwind without leaking either state.
-                _streaming_skill_home_snapshot = snapshot_skill_home_modules()
-                patch_skill_home_modules(Path(_profile_home))
-            old_profile_env = {key: os.environ.get(key) for key in _safe_profile_runtime_env}
-            old_cwd = os.environ.get('TERMINAL_CWD')
-            old_exec_ask = os.environ.get('HERMES_EXEC_ASK')
-            old_session_key = os.environ.get('HERMES_SESSION_KEY')
-            old_session_id = os.environ.get('HERMES_SESSION_ID')
-            old_session_platform = os.environ.get('HERMES_SESSION_PLATFORM')
-            old_session_chat_id = os.environ.get('HERMES_SESSION_CHAT_ID')
-            old_hermes_home = os.environ.get('HERMES_HOME')
-            os.environ.update(_safe_profile_runtime_env)
-            os.environ['TERMINAL_CWD'] = str(s.workspace)
-            os.environ['HERMES_EXEC_ASK'] = '1'
-            os.environ['HERMES_SESSION_KEY'] = session_id
-            os.environ['HERMES_SESSION_ID'] = session_id
-            os.environ['HERMES_SESSION_PLATFORM'] = 'webui'
-            # process_complete wiring (ours-original, Option B): see
-            # _build_agent_thread_env above.
-            os.environ['HERMES_SESSION_CHAT_ID'] = str(session_id)
-            if _profile_home:
-                os.environ['HERMES_HOME'] = _profile_home
-                # Prefer context-local Hermes-home overrides when available.
-                # In that mode, tools.skills_tool._skills_dir() and
-                # tools.skill_manager_tool._skills_dir() can resolve the active
-                # profile from get_hermes_home() and keep per-thread isolation
-                # without mutating module globals. If override installation
-                # succeeds for both modules, skip process-cache patching.
-                # If either module is static/missing/raises, the legacy path
-                # above has already snapshotted and patched under this lock.
+        if not _request_context_v2:
+            with _ENV_LOCK:
+                if _restore_streaming_skill_home_modules:
+                    # Snapshot and patch before mutating process env so setup
+                    # failures can unwind without leaking either state.
+                    _streaming_skill_home_snapshot = snapshot_skill_home_modules()
+                    patch_skill_home_modules(Path(_profile_home))
+                old_profile_env = {
+                    key: os.environ.get(key) for key in _safe_profile_runtime_env
+                }
+                old_cwd = os.environ.get('TERMINAL_CWD')
+                old_exec_ask = os.environ.get('HERMES_EXEC_ASK')
+                old_session_key = os.environ.get('HERMES_SESSION_KEY')
+                old_session_id = os.environ.get('HERMES_SESSION_ID')
+                old_session_platform = os.environ.get('HERMES_SESSION_PLATFORM')
+                old_session_chat_id = os.environ.get('HERMES_SESSION_CHAT_ID')
+                old_hermes_home = os.environ.get('HERMES_HOME')
+                os.environ.update(_safe_profile_runtime_env)
+                os.environ['TERMINAL_CWD'] = str(s.workspace)
+                os.environ['HERMES_EXEC_ASK'] = '1'
+                os.environ['HERMES_SESSION_KEY'] = session_id
+                os.environ['HERMES_SESSION_ID'] = session_id
+                os.environ['HERMES_SESSION_PLATFORM'] = 'webui'
+                # process_complete wiring (ours-original, Option B): see
+                # _build_agent_thread_env above.
+                os.environ['HERMES_SESSION_CHAT_ID'] = str(session_id)
+                if _profile_home:
+                    os.environ['HERMES_HOME'] = _profile_home
+            _process_env_mirror_applied = True
         # Lock released — agent runs without holding it
         # ── MCP Server Discovery (lazy import, idempotent) ──
-        # MUST run AFTER the HERMES_HOME mutation above — `discover_mcp_tools()`
-        # reads `~/.hermes/config.yaml` via `get_hermes_home()`, which uses
-        # `os.environ['HERMES_HOME']`.  Calling it before the mutation always
-        # loaded the default profile's `mcp_servers`, even when the session
-        # was stamped with a non-default profile.  See issue #1968.
+        # MUST run AFTER the per-turn home binding above. Legacy mode carries it
+        # in os.environ; request-context v2 carries it in the context-local
+        # Hermes-home override. Calling discovery before either binding loads
+        # the default profile's mcp_servers. See issue #1968.
         #
         # NOTE: `_servers` in `tools/mcp_tool.py` is a process-global registry
         # keyed by server name.  This means once profile A registers a server
@@ -12395,24 +12554,25 @@ def _run_agent_streaming(
                     _unreg_clarify_notify(session_id)
                 except Exception:
                     logger.debug("Failed to unregister clarify callback")
-            with _ENV_LOCK:
-                for _key, _old_value in old_profile_env.items():
-                    if _old_value is None: os.environ.pop(_key, None)
-                    else: os.environ[_key] = _old_value
-                if old_cwd is None: os.environ.pop('TERMINAL_CWD', None)
-                else: os.environ['TERMINAL_CWD'] = old_cwd
-                if old_exec_ask is None: os.environ.pop('HERMES_EXEC_ASK', None)
-                else: os.environ['HERMES_EXEC_ASK'] = old_exec_ask
-                if old_session_key is None: os.environ.pop('HERMES_SESSION_KEY', None)
-                else: os.environ['HERMES_SESSION_KEY'] = old_session_key
-                if old_session_id is None: os.environ.pop('HERMES_SESSION_ID', None)
-                else: os.environ['HERMES_SESSION_ID'] = old_session_id
-                if old_session_platform is None: os.environ.pop('HERMES_SESSION_PLATFORM', None)
-                else: os.environ['HERMES_SESSION_PLATFORM'] = old_session_platform
-                if old_session_chat_id is None: os.environ.pop('HERMES_SESSION_CHAT_ID', None)
-                else: os.environ['HERMES_SESSION_CHAT_ID'] = old_session_chat_id
-                if old_hermes_home is None: os.environ.pop('HERMES_HOME', None)
-                else: os.environ['HERMES_HOME'] = old_hermes_home
+            if _process_env_mirror_applied:
+                with _ENV_LOCK:
+                    for _key, _old_value in old_profile_env.items():
+                        if _old_value is None: os.environ.pop(_key, None)
+                        else: os.environ[_key] = _old_value
+                    if old_cwd is None: os.environ.pop('TERMINAL_CWD', None)
+                    else: os.environ['TERMINAL_CWD'] = old_cwd
+                    if old_exec_ask is None: os.environ.pop('HERMES_EXEC_ASK', None)
+                    else: os.environ['HERMES_EXEC_ASK'] = old_exec_ask
+                    if old_session_key is None: os.environ.pop('HERMES_SESSION_KEY', None)
+                    else: os.environ['HERMES_SESSION_KEY'] = old_session_key
+                    if old_session_id is None: os.environ.pop('HERMES_SESSION_ID', None)
+                    else: os.environ['HERMES_SESSION_ID'] = old_session_id
+                    if old_session_platform is None: os.environ.pop('HERMES_SESSION_PLATFORM', None)
+                    else: os.environ['HERMES_SESSION_PLATFORM'] = old_session_platform
+                    if old_session_chat_id is None: os.environ.pop('HERMES_SESSION_CHAT_ID', None)
+                    else: os.environ['HERMES_SESSION_CHAT_ID'] = old_session_chat_id
+                    if old_hermes_home is None: os.environ.pop('HERMES_HOME', None)
+                    else: os.environ['HERMES_HOME'] = old_hermes_home
 
     except Exception as e:
         print('[webui] stream error:\n' + traceback.format_exc(), flush=True)
@@ -12848,7 +13008,11 @@ def _run_agent_streaming(
                 and getattr(s, 'pending_user_message', None)):
             update_active_run(stream_id, phase="finalizing")
             _last_resort_sync_from_core(s, stream_id, _agent_lock)
-        _clear_thread_env()  # TD1: always clear thread-local context
+        if _request_context_v2_ctx is not None:
+            _reset_request_context_v2(_request_context_v2_ctx)
+            _request_context_v2_ctx = None
+        else:
+            _clear_thread_env()  # TD1: always clear thread-local context
         if _streaming_cron_profile_home_token is not None:
             _STREAMING_CRON_PROFILE_HOME.reset(_streaming_cron_profile_home_token)
         if _restore_streaming_skill_home_modules and _streaming_skill_home_snapshot is not None:
@@ -12863,7 +13027,8 @@ def _run_agent_streaming(
         if _acquired_streaming_skill_home_patch_lock:
             _SKILL_HOME_MODULE_PATCH_LOCK.release()
             _acquired_streaming_skill_home_patch_lock = False
-        _reset_streaming_hermes_home_override(*_streaming_hermes_home_override_ctx)
+        if not _request_context_v2:
+            _reset_streaming_hermes_home_override(*_streaming_hermes_home_override_ctx)
         # xsession wakeup misroute root fix (Option 1): restore the per-turn
         # session-identity context-locals (reset-token semantics). MUST run on
         # every exit path so a reused thread-pool worker leaks no identity and

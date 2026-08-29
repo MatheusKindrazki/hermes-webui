@@ -913,3 +913,99 @@ def test_expand_env_vars_does_not_leak_process_env_under_block_scope(monkeypatch
         else:
             config._thread_ctx.env = prev_env
 
+
+def test_request_context_v2_interleaves_profiles_without_process_env_authority(
+    monkeypatch, tmp_path
+):
+    """Two streaming turns keep profile identity local while running concurrently."""
+    import threading
+
+    from agent.runtime_cwd import resolve_agent_cwd
+    from agent.secret_scope import get_secret
+    from api import streaming
+    from gateway.session_context import get_session_env
+    from hermes_constants import get_hermes_home
+
+    monkeypatch.setenv("HERMES_REQUEST_CONTEXT_V2", "1")
+    monkeypatch.setenv("HERMES_HOME", "/process/default-home")
+    monkeypatch.setenv("OPENAI_API_KEY", "process-default-secret")
+    monkeypatch.setenv("TERMINAL_CWD", "/process/default-workspace")
+    barrier = threading.Barrier(2)
+    observations = {}
+    errors = []
+
+    def worker(name):
+        profile_home = tmp_path / f"home-{name}"
+        workspace = tmp_path / f"workspace-{name}"
+        profile_home.mkdir()
+        workspace.mkdir()
+        context = None
+        try:
+            context = streaming._install_request_context_v2(
+                thread_env={
+                    "HERMES_HOME": str(profile_home),
+                    "TERMINAL_CWD": str(workspace),
+                    "OPENAI_API_KEY": f"secret-{name}",
+                    "PROFILE_PROBE": name,
+                },
+                session_id=f"session-{name}",
+                workspace=str(workspace),
+                profile=name,
+            )
+            barrier.wait(timeout=5)
+            observations[name] = {
+                "profile_probe": config._thread_local_env_value("PROFILE_PROBE"),
+                "secret": get_secret("OPENAI_API_KEY"),
+                "home": str(get_hermes_home()),
+                "cwd": str(resolve_agent_cwd()),
+                "session_id": get_session_env("HERMES_SESSION_ID"),
+                "profile": get_session_env("HERMES_SESSION_PROFILE"),
+                "process_home": os.environ.get("HERMES_HOME"),
+                "process_secret": os.environ.get("OPENAI_API_KEY"),
+            }
+            barrier.wait(timeout=5)
+        except Exception as exc:  # pragma: no cover - asserted below
+            errors.append(exc)
+        finally:
+            if context is not None:
+                streaming._reset_request_context_v2(context)
+
+    threads = [threading.Thread(target=worker, args=(name,)) for name in ("work", "personal")]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=10)
+
+    assert errors == []
+    assert all(not thread.is_alive() for thread in threads)
+    for name in ("work", "personal"):
+        assert observations[name] == {
+            "profile_probe": name,
+            "secret": f"secret-{name}",
+            "home": str(tmp_path / f"home-{name}"),
+            "cwd": str(tmp_path / f"workspace-{name}"),
+            "session_id": f"session-{name}",
+            "profile": name,
+            "process_home": "/process/default-home",
+            "process_secret": "process-default-secret",
+        }
+    assert os.environ["HERMES_HOME"] == "/process/default-home"
+    assert os.environ["OPENAI_API_KEY"] == "process-default-secret"
+
+
+def test_streaming_worker_wires_v2_scope_and_guards_process_env_mirror():
+    """The production worker must consume the isolated scope, not leave it dormant."""
+    import inspect
+
+    from api import streaming
+
+    source = inspect.getsource(streaming._run_agent_streaming)
+    flag_position = source.index("_request_context_v2 = _request_context_v2_enabled()")
+    install_position = source.index("_install_request_context_v2(")
+    mirror_guard_position = source.index("if not _request_context_v2:", install_position)
+    mirror_position = source.index("os.environ.update(_safe_profile_runtime_env)")
+    reset_position = source.index("_reset_request_context_v2(")
+    cleanup_position = source.index("STREAMS.pop(stream_id, None)")
+
+    assert flag_position < install_position < mirror_guard_position < mirror_position
+    assert reset_position < cleanup_position
