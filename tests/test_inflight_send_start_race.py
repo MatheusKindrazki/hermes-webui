@@ -191,3 +191,26 @@ def test_server_idle_row_wins_over_stale_optimistic_count():
     assert "title:keepLocalOptimistic?(local.title||fetched.title):fetched.title" in body, (
         "stale optimistic provisional title must not override a confirmed idle server row"
     )
+
+
+def test_server_queued_start_is_non_terminal_and_not_requeued_in_browser():
+    """A durable 202 queue receipt must not attach a missing stream or duplicate locally."""
+    body = _function_body(MESSAGES_JS, "send")
+    receipt_idx = body.index("if(startData&&startData.status==='queued')")
+    attach_idx = body.index("attachLiveStream(activeSid, streamId, uploadedNames);")
+    queued_block = body[receipt_idx:attach_idx]
+
+    assert receipt_idx < attach_idx
+    assert "delete INFLIGHT[activeSid]" in queued_block
+    assert "loadSession(activeSid)" in queued_block
+    assert "queueSessionMessage(" not in queued_block
+    assert "return;" in queued_block
+
+
+def test_chat_start_sends_stable_client_turn_id_for_transport_retries():
+    body = _function_body(MESSAGES_JS, "send")
+    post_idx = body.index("api('/api/chat/start'")
+    payload = body[post_idx : post_idx + 900]
+
+    assert "client_turn_id:clientTurnId" in payload
+    assert "const clientTurnId=" in body[:post_idx]

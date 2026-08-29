@@ -1207,6 +1207,7 @@ class Session:
                  pending_attachments=None,
                  pending_started_at=None,
                  pending_user_source: str=None,
+                 queued_user_turns=None,
                  context_messages=None,
                  compression_anchor_visible_idx=None,
                  compression_anchor_message_key=None,
@@ -1292,6 +1293,7 @@ class Session:
         self.pending_attachments = pending_attachments or []
         self.pending_started_at = pending_started_at
         self.pending_user_source = pending_user_source
+        self.queued_user_turns = queued_user_turns if isinstance(queued_user_turns, list) else []
         self.context_messages = context_messages if isinstance(context_messages, list) else []
         self.compression_anchor_visible_idx = compression_anchor_visible_idx
         self.compression_anchor_message_key = compression_anchor_message_key
@@ -1399,6 +1401,7 @@ class Session:
             'cache_read_tokens', 'cache_write_tokens',
             'personality', 'active_stream_id',
             'pending_user_message', 'pending_attachments', 'pending_started_at', 'pending_user_source',
+            'queued_user_turns',
             'compression_anchor_visible_idx', 'compression_anchor_message_key',
             'compression_anchor_summary', 'pre_compression_snapshot',
             'context_engine', 'compression_anchor_engine', 'compression_anchor_mode',
@@ -1794,6 +1797,7 @@ class Session:
             'active_stream_id': self.active_stream_id,
             'pending_user_message': self.pending_user_message,
             'has_pending_user_message': has_pending_user_message,
+            'queued_user_turn_count': len(self.queued_user_turns),
             'is_cli_session': self.is_cli_session,
             'source_tag': self.source_tag,
             'raw_source': self.raw_source,

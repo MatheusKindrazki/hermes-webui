@@ -1612,6 +1612,9 @@ async function send(){
   if(!S.session){await newSession();await renderSessionList();}
 
   const activeSid=S.session.session_id;
+  const clientTurnId=(globalThis.crypto&&typeof globalThis.crypto.randomUUID==='function')
+    ? globalThis.crypto.randomUUID()
+    : `webui-${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
   _sendInProgressSid=activeSid;
 
   // Salvage of #4750 (@harryazj): capture the composer text and clear the
@@ -1804,6 +1807,7 @@ async function send(){
       model:_modelState.model,workspace:S.session.workspace,
       model_provider:_modelState.model_provider,
       profile:S.activeProfile||S.session.profile||'default',
+      client_turn_id:clientTurnId,
       explicit_model_pick:_explicitPick||undefined,
       attachments:uploaded.length?uploaded:undefined,
       moa_config:_pendingMoaConfig?true:undefined
@@ -1879,6 +1883,17 @@ async function send(){
   }
 
   const startData = postStartData || {};
+  if(startData&&startData.status==='queued'){
+    delete INFLIGHT[activeSid];
+    if(typeof clearInflightState==='function') clearInflightState(activeSid);
+    stopApprovalPolling();
+    stopClarifyPolling();
+    removeThinking();
+    showToast('Message queued safely. It will start after the current turn.',2600);
+    try{ await loadSession(activeSid); }
+    catch(_){ setBusy(false);setComposerStatus('Message queued safely.'); }
+    return;
+  }
   streamId = postStartData ? postStartData.stream_id : null;
   S.activeStreamId = streamId;
   // setBusy(true) already ran with activeStreamId=null; refresh now that we
