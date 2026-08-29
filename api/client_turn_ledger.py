@@ -95,7 +95,7 @@ class ClientTurnLedger:
     def _install_schema(self) -> None:
         with self._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
-            conn.executescript(_SCHEMA_V1)
+            conn.execute(_SCHEMA_V1)
             conn.commit()
 
     def get(self, lineage_root_id: str, client_turn_id: str) -> dict[str, Any] | None:

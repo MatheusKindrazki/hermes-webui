@@ -74,6 +74,28 @@ def test_client_turn_ledger_installs_v1_schema(tmp_path):
         assert f"'{state}'" in table_sql
 
 
+def test_schema_install_keeps_create_inside_begin_immediate(tmp_path):
+    traced_statements = []
+
+    class TracedClientTurnLedger(ClientTurnLedger):
+        def _connect(self):
+            conn = super()._connect()
+            conn.set_trace_callback(traced_statements.append)
+            return conn
+
+    TracedClientTurnLedger(tmp_path / "client-turn-ledger.sqlite3")
+    normalized = [" ".join(statement.upper().split()) for statement in traced_statements]
+    begin_position = normalized.index("BEGIN IMMEDIATE")
+    create_position = next(
+        idx
+        for idx, statement in enumerate(normalized)
+        if statement.startswith("CREATE TABLE IF NOT EXISTS CLIENT_TURN_LEDGER")
+    )
+    commit_position = normalized.index("COMMIT")
+
+    assert begin_position < create_position < commit_position
+
+
 @pytest.mark.parametrize("state", ["queued", "started", "completed"])
 def test_retry_returns_original_receipt_for_durable_states(tmp_path, state):
     db_path = tmp_path / "client-turn-ledger.sqlite3"
@@ -184,6 +206,36 @@ def test_start_retry_returns_original_receipt_without_second_worker(tmp_path, mo
     )
     assert mismatch["_status"] == 409
     assert mismatch["code"] == "client_turn_id_payload_mismatch"
+
+
+def test_queue_overflow_does_not_publish_unpersisted_ledger_receipt(tmp_path, monkeypatch):
+    session = _install_route_session(tmp_path, monkeypatch)
+    session.active_stream_id = "busy-stream"
+    session.pending_user_message = "active turn"
+    session.pending_started_at = routes.time.time()
+    session.queued_user_turns = [
+        {"turn_id": f"queued-{idx}", "client_turn_id": f"client-{idx}"}
+        for idx in range(routes.MAX_QUEUED_USER_TURNS)
+    ]
+    session.save()
+    config.STREAMS["busy-stream"] = queue.Queue()
+    kwargs = {
+        "msg": "must not be accepted",
+        "attachments": [],
+        "workspace": str(tmp_path),
+        "model": "test-model",
+        "model_provider": "test-provider",
+        "client_turn_id": "overflow-ledger-client",
+    }
+
+    first = routes._start_chat_stream_for_session(session, **kwargs)
+    retry = routes._start_chat_stream_for_session(session, **kwargs)
+
+    assert first["_status"] == 429
+    assert retry["_status"] == 429
+    assert first["code"] == retry["code"] == "queued_turn_limit"
+    ledger = ClientTurnLedger(config.STATE_DIR / "client_turn_ledger.sqlite3")
+    assert ledger.get(session.session_id, "overflow-ledger-client") is None
 
 
 @pytest.mark.parametrize(

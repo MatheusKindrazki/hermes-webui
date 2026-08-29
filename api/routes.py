@@ -22852,6 +22852,22 @@ def _queue_active_chat_start_locked(
     client_turn_id,
     ledger_context=None,
 ):
+    queued_turns = list(getattr(session, "queued_user_turns", None) or [])
+    client_id = str(client_turn_id or "").strip()[:128]
+    if client_id:
+        for existing in queued_turns:
+            if str(existing.get("client_turn_id") or "") == client_id:
+                return _queued_chat_start_response(
+                    session, existing, active_stream_id
+                )
+    if len(queued_turns) >= MAX_QUEUED_USER_TURNS:
+        return {
+            "error": "Too many messages are already queued for this session.",
+            "code": "queued_turn_limit",
+            "queue_limit": MAX_QUEUED_USER_TURNS,
+            "active_stream_id": active_stream_id,
+            "_status": 429,
+        }
     reserved_turn_id = f"queued-{uuid.uuid4().hex}"
     ledger_record = None
     if ledger_context is not None:
