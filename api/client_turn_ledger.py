@@ -43,6 +43,29 @@ CREATE TABLE IF NOT EXISTS client_turn_ledger(
 );
 """
 
+_ADMISSION_ANCHOR_SCHEMA_V1 = """
+CREATE TABLE IF NOT EXISTS client_turn_admission_anchor(
+  lineage_root_id TEXT NOT NULL,
+  client_turn_id TEXT NOT NULL,
+  phase TEXT NOT NULL CHECK(phase IN (
+    'claimed','queue_persisted','stream_registered','legacy_unverified','settled')),
+  updated_at REAL NOT NULL,
+  PRIMARY KEY(lineage_root_id,client_turn_id),
+  FOREIGN KEY(lineage_root_id,client_turn_id)
+    REFERENCES client_turn_ledger(lineage_root_id,client_turn_id)
+);
+"""
+
+_ADMISSION_ANCHOR_PHASES = frozenset(
+    {
+        "claimed",
+        "queue_persisted",
+        "stream_registered",
+        "legacy_unverified",
+        "settled",
+    }
+)
+
 
 class ClientTurnLedgerError(RuntimeError):
     """Base typed failure for ledger operations."""
@@ -96,6 +119,20 @@ class ClientTurnLedger:
         with self._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
             conn.execute(_SCHEMA_V1)
+            conn.execute(_ADMISSION_ANCHOR_SCHEMA_V1)
+            # Existing v1 rows predate the admission anchor. Never guess that
+            # their queued/started work is recoverable: the route reconciler
+            # validates the persisted queue or live stream before replaying the
+            # original receipt.
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO client_turn_admission_anchor(
+                  lineage_root_id, client_turn_id, phase, updated_at
+                )
+                SELECT lineage_root_id, client_turn_id, 'legacy_unverified', updated_at
+                FROM client_turn_ledger
+                """
+            )
             conn.commit()
 
     def get(self, lineage_root_id: str, client_turn_id: str) -> dict[str, Any] | None:
@@ -122,6 +159,24 @@ class ClientTurnLedger:
                 LIMIT 1
                 """,
                 (stream,),
+            ).fetchone()
+        return _row_dict(row)
+
+    def get_admission_anchor(
+        self,
+        lineage_root_id: str,
+        client_turn_id: str,
+    ) -> dict[str, Any] | None:
+        """Return the durable claim-to-work phase for one browser turn."""
+        lineage = _required_text(lineage_root_id, "lineage_root_id")
+        client_id = _required_text(client_turn_id, "client_turn_id")
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT * FROM client_turn_admission_anchor
+                WHERE lineage_root_id = ? AND client_turn_id = ?
+                """,
+                (lineage, client_id),
             ).fetchone()
         return _row_dict(row)
 
@@ -187,6 +242,14 @@ class ClientTurnLedger:
                     now,
                 ),
             )
+            conn.execute(
+                """
+                INSERT INTO client_turn_admission_anchor(
+                  lineage_root_id, client_turn_id, phase, updated_at
+                ) VALUES (?, ?, 'claimed', ?)
+                """,
+                (lineage, client_id, now),
+            )
             row = conn.execute(
                 """
                 SELECT * FROM client_turn_ledger
@@ -196,6 +259,52 @@ class ClientTurnLedger:
             ).fetchone()
             conn.commit()
         return dict(row), True
+
+    def set_admission_anchor(
+        self,
+        lineage_root_id: str,
+        client_turn_id: str,
+        *,
+        phase: str,
+    ) -> dict[str, Any]:
+        """Durably mark when a claim gains queue/stream recovery evidence."""
+        lineage = _required_text(lineage_root_id, "lineage_root_id")
+        client_id = _required_text(client_turn_id, "client_turn_id")
+        if phase not in _ADMISSION_ANCHOR_PHASES:
+            raise ValueError(f"invalid client turn admission phase: {phase}")
+        now = time.time()
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            exists = conn.execute(
+                """
+                SELECT 1 FROM client_turn_ledger
+                WHERE lineage_root_id = ? AND client_turn_id = ?
+                """,
+                (lineage, client_id),
+            ).fetchone()
+            if exists is None:
+                conn.rollback()
+                raise KeyError((lineage, client_id))
+            conn.execute(
+                """
+                INSERT INTO client_turn_admission_anchor(
+                  lineage_root_id, client_turn_id, phase, updated_at
+                ) VALUES (?, ?, ?, ?)
+                ON CONFLICT(lineage_root_id,client_turn_id) DO UPDATE SET
+                  phase = excluded.phase,
+                  updated_at = excluded.updated_at
+                """,
+                (lineage, client_id, phase, now),
+            )
+            row = conn.execute(
+                """
+                SELECT * FROM client_turn_admission_anchor
+                WHERE lineage_root_id = ? AND client_turn_id = ?
+                """,
+                (lineage, client_id),
+            ).fetchone()
+            conn.commit()
+        return dict(row)
 
     def transition(
         self,
@@ -238,6 +347,15 @@ class ClientTurnLedger:
                 """,
                 (state, next_stream, next_session, now, lineage, client_id),
             )
+            if state in {"completed", "recovery_required", "failed_retryable"}:
+                conn.execute(
+                    """
+                    UPDATE client_turn_admission_anchor
+                    SET phase = 'settled', updated_at = ?
+                    WHERE lineage_root_id = ? AND client_turn_id = ?
+                    """,
+                    (now, lineage, client_id),
+                )
             row = conn.execute(
                 """
                 SELECT * FROM client_turn_ledger
@@ -293,6 +411,19 @@ class ClientTurnLedger:
                     existing["client_turn_id"],
                 ),
             )
+            if state in {"completed", "recovery_required", "failed_retryable"}:
+                conn.execute(
+                    """
+                    UPDATE client_turn_admission_anchor
+                    SET phase = 'settled', updated_at = ?
+                    WHERE lineage_root_id = ? AND client_turn_id = ?
+                    """,
+                    (
+                        now,
+                        existing["lineage_root_id"],
+                        existing["client_turn_id"],
+                    ),
+                )
             row = conn.execute(
                 """
                 SELECT * FROM client_turn_ledger

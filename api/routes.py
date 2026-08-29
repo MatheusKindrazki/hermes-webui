@@ -22669,6 +22669,57 @@ _QUEUED_USER_TURN_DRAINS = set()
 _QUEUED_USER_TURN_DRAINS_LOCK = threading.Lock()
 MAX_QUEUED_USER_TURNS = 32
 
+_CLIENT_TURN_ADMISSIONS_IN_FLIGHT: dict[tuple[str, str], int] = {}
+_CLIENT_TURN_ADMISSIONS_IN_FLIGHT_LOCK = threading.Lock()
+
+
+class ClientTurnAdmissionCrash(BaseException):
+    """Test-only process-crash simulation after a durable ledger claim."""
+
+
+def _client_turn_admission_key(context) -> tuple[str, str]:
+    return (context["lineage_root_id"], context["client_turn_id"])
+
+
+def _begin_client_turn_admission(context) -> None:
+    if context is None:
+        return
+    key = _client_turn_admission_key(context)
+    with _CLIENT_TURN_ADMISSIONS_IN_FLIGHT_LOCK:
+        _CLIENT_TURN_ADMISSIONS_IN_FLIGHT[key] = (
+            _CLIENT_TURN_ADMISSIONS_IN_FLIGHT.get(key, 0) + 1
+        )
+
+
+def _end_client_turn_admission(context) -> None:
+    if context is None:
+        return
+    key = _client_turn_admission_key(context)
+    with _CLIENT_TURN_ADMISSIONS_IN_FLIGHT_LOCK:
+        remaining = _CLIENT_TURN_ADMISSIONS_IN_FLIGHT.get(key, 0) - 1
+        if remaining > 0:
+            _CLIENT_TURN_ADMISSIONS_IN_FLIGHT[key] = remaining
+        else:
+            _CLIENT_TURN_ADMISSIONS_IN_FLIGHT.pop(key, None)
+
+
+def _client_turn_admission_in_flight(context) -> bool:
+    key = _client_turn_admission_key(context)
+    with _CLIENT_TURN_ADMISSIONS_IN_FLIGHT_LOCK:
+        return _CLIENT_TURN_ADMISSIONS_IN_FLIGHT.get(key, 0) > 0
+
+
+def _client_turn_failpoint(context, name: str) -> None:
+    configured = str(
+        os.getenv("HERMES_WEBUI_CLIENT_TURN_FAILPOINT", "") or ""
+    ).strip()
+    if configured != name:
+        return
+    # A real process crash clears process-local ownership. Mirror that fact so
+    # the next request exercises restart reconciliation in the same test process.
+    _end_client_turn_admission(context)
+    raise ClientTurnAdmissionCrash(name)
+
 
 def _client_turn_ledger_enabled() -> bool:
     return str(os.getenv("HERMES_TURN_LEDGER_ENABLED", "0") or "0").strip().lower() in {
@@ -22743,6 +22794,7 @@ def _client_turn_ledger_context(
         "ledger": default_client_turn_ledger(),
         "lineage_root_id": _client_turn_lineage_root_id(session),
         "client_turn_id": client_id,
+        "session_id": str(getattr(session, "session_id", "") or ""),
         "request_sha256": _client_turn_request_sha256(
             message=message,
             attachments=attachments,
@@ -22764,6 +22816,58 @@ def _client_turn_receipt_from_record(record) -> dict:
     return receipt
 
 
+def _client_turn_terminal_error(record) -> dict:
+    state = str(record.get("state") or "")
+    recovery_required = state == "recovery_required"
+    return {
+        "error": (
+            "Turn admission was interrupted before recoverable work was persisted."
+            if recovery_required
+            else "The previous turn attempt failed before it could complete."
+        ),
+        "code": (
+            "client_turn_recovery_required"
+            if recovery_required
+            else "client_turn_failed_retryable"
+        ),
+        "retryable": not recovery_required,
+        "turn_id": record.get("turn_id"),
+        "session_id": record.get("current_session_id"),
+        "stream_id": record.get("stream_id"),
+        "_status": 409 if recovery_required else 503,
+    }
+
+
+def _client_turn_has_durable_work(context, record) -> bool:
+    """Validate that a queued/started receipt still points at executable work."""
+    if _client_turn_admission_in_flight(context):
+        return True
+    state = str(record.get("state") or "")
+    if state == "queued":
+        try:
+            persisted = Session.load(str(record.get("current_session_id") or ""))
+        except Exception:
+            persisted = None
+        return any(
+            str(row.get("turn_id") or "") == str(record.get("turn_id") or "")
+            for row in list(getattr(persisted, "queued_user_turns", None) or [])
+            if isinstance(row, dict)
+        )
+    if state == "started":
+        stream_id = str(record.get("stream_id") or "")
+        if not stream_id:
+            return False
+        with STREAMS_LOCK:
+            if stream_id in STREAMS:
+                return True
+        try:
+            with ACTIVE_RUNS_LOCK:
+                return stream_id in (ACTIVE_RUNS or {})
+        except Exception:
+            return False
+    return state == "completed"
+
+
 def _client_turn_existing_response(context, *, queued_turn_id=None):
     if context is None:
         return None, None
@@ -22783,6 +22887,20 @@ def _client_turn_existing_response(context, *, queued_turn_id=None):
             "code": mismatch.code,
             "_status": mismatch.status_code,
         }, record
+    state = str(record.get("state") or "")
+    if state in {"recovery_required", "failed_retryable"}:
+        return _client_turn_terminal_error(record), record
+    if state in {"queued", "started"} and not _client_turn_has_durable_work(
+        context, record
+    ):
+        record = context["ledger"].transition(
+            context["lineage_root_id"],
+            context["client_turn_id"],
+            state="recovery_required",
+            stream_id=record.get("stream_id"),
+            current_session_id=record.get("current_session_id"),
+        )
+        return _client_turn_terminal_error(record), record
     if (
         queued_turn_id
         and str(record.get("turn_id") or "") == str(queued_turn_id)
@@ -22878,18 +22996,25 @@ def _queue_active_chat_start_locked(
             "active_stream_id": active_stream_id,
             "_status": 202,
         }
-        ledger_record, created = ledger_context["ledger"].claim(
-            lineage_root_id=ledger_context["lineage_root_id"],
-            client_turn_id=ledger_context["client_turn_id"],
-            turn_id=reserved_turn_id,
-            current_session_id=session.session_id,
-            stream_id=None,
-            request_sha256=ledger_context["request_sha256"],
-            receipt=receipt,
-            state="queued",
-        )
+        _begin_client_turn_admission(ledger_context)
+        try:
+            ledger_record, created = ledger_context["ledger"].claim(
+                lineage_root_id=ledger_context["lineage_root_id"],
+                client_turn_id=ledger_context["client_turn_id"],
+                turn_id=reserved_turn_id,
+                current_session_id=session.session_id,
+                stream_id=None,
+                request_sha256=ledger_context["request_sha256"],
+                receipt=receipt,
+                state="queued",
+            )
+        except Exception:
+            _end_client_turn_admission(ledger_context)
+            raise
         if not created:
+            _end_client_turn_admission(ledger_context)
             return _client_turn_receipt_from_record(ledger_record)
+        _client_turn_failpoint(ledger_context, "after_queued_claim")
     try:
         queued = _enqueue_queued_user_turn(
             session,
@@ -22909,6 +23034,7 @@ def _queue_active_chat_start_locked(
                 ledger_context["client_turn_id"],
                 state="recovery_required",
             )
+            _end_client_turn_admission(ledger_context)
         return {
             "error": "Too many messages are already queued for this session.",
             "code": "queued_turn_limit",
@@ -22916,6 +23042,24 @@ def _queue_active_chat_start_locked(
             "active_stream_id": active_stream_id,
             "_status": 429,
         }
+    except Exception:
+        if ledger_context is not None and ledger_record is not None:
+            ledger_context["ledger"].transition(
+                ledger_context["lineage_root_id"],
+                ledger_context["client_turn_id"],
+                state="recovery_required",
+            )
+            _end_client_turn_admission(ledger_context)
+        raise
+    if ledger_context is not None and ledger_record is not None:
+        try:
+            ledger_context["ledger"].set_admission_anchor(
+                ledger_context["lineage_root_id"],
+                ledger_context["client_turn_id"],
+                phase="queue_persisted",
+            )
+        finally:
+            _end_client_turn_admission(ledger_context)
     return _queued_chat_start_response(session, queued, active_stream_id)
 
 
@@ -23506,13 +23650,23 @@ def _start_chat_stream_for_session(
                         else f"turn-{uuid.uuid4().hex}"
                     )
                     if existing_ledger_record is not None:
-                        ledger_context["ledger"].transition(
-                            ledger_context["lineage_root_id"],
-                            ledger_context["client_turn_id"],
-                            state="started",
-                            stream_id=stream_id,
-                            current_session_id=s.session_id,
-                        )
+                        _begin_client_turn_admission(ledger_context)
+                        try:
+                            ledger_context["ledger"].set_admission_anchor(
+                                ledger_context["lineage_root_id"],
+                                ledger_context["client_turn_id"],
+                                phase="claimed",
+                            )
+                            ledger_context["ledger"].transition(
+                                ledger_context["lineage_root_id"],
+                                ledger_context["client_turn_id"],
+                                state="started",
+                                stream_id=stream_id,
+                                current_session_id=s.session_id,
+                            )
+                        except Exception:
+                            _end_client_turn_admission(ledger_context)
+                            raise
                     else:
                         next_title = getattr(s, "title", None)
                         if _is_default_or_empty_session_title(next_title):
@@ -23530,18 +23684,28 @@ def _start_chat_stream_for_session(
                             receipt["effective_model"] = model
                         if model_provider:
                             receipt["effective_model_provider"] = model_provider
-                        claimed_record, created = ledger_context["ledger"].claim(
-                            lineage_root_id=ledger_context["lineage_root_id"],
-                            client_turn_id=ledger_context["client_turn_id"],
-                            turn_id=ledger_turn_id,
-                            current_session_id=s.session_id,
-                            stream_id=stream_id,
-                            request_sha256=ledger_context["request_sha256"],
-                            receipt=receipt,
-                            state="started",
-                        )
+                        _begin_client_turn_admission(ledger_context)
+                        try:
+                            claimed_record, created = ledger_context["ledger"].claim(
+                                lineage_root_id=ledger_context["lineage_root_id"],
+                                client_turn_id=ledger_context["client_turn_id"],
+                                turn_id=ledger_turn_id,
+                                current_session_id=s.session_id,
+                                stream_id=stream_id,
+                                request_sha256=ledger_context["request_sha256"],
+                                receipt=receipt,
+                                state="started",
+                            )
+                        except Exception:
+                            _end_client_turn_admission(ledger_context)
+                            raise
                         if not created:
+                            _end_client_turn_admission(ledger_context)
                             return _client_turn_receipt_from_record(claimed_record)
+                    _client_turn_failpoint(
+                        ledger_context,
+                        "after_started_claim",
+                    )
                 if queued_turn_id:
                     s.queued_user_turns = [
                         row for row in list(getattr(s, "queued_user_turns", None) or [])
@@ -23570,12 +23734,21 @@ def _start_chat_stream_for_session(
                             stream_id=stream_id,
                             current_session_id=s.session_id,
                         )
+                        _end_client_turn_admission(ledger_context)
                     raise
                 if ledger_context is not None:
                     stream = create_stream_channel()
                     register_stream_owner(stream_id, s.session_id)
                     with STREAMS_LOCK:
                         STREAMS[stream_id] = stream
+                    try:
+                        ledger_context["ledger"].set_admission_anchor(
+                            ledger_context["lineage_root_id"],
+                            ledger_context["client_turn_id"],
+                            phase="stream_registered",
+                        )
+                    finally:
+                        _end_client_turn_admission(ledger_context)
                 break
         if needs_stale_cleanup:
             diag.stage("stale_stream_cleanup") if diag else None
