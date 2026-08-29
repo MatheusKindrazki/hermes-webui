@@ -138,4 +138,3 @@ def test_canary_kill_switch_change_does_not_strand_admitted_ledger_row(
     )
 
     assert ledger.get_by_stream("stream")["state"] == "completed"
-

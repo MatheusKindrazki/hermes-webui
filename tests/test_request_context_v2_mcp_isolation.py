@@ -113,4 +113,3 @@ def test_v2_without_enabled_mcp_servers_does_not_require_registry_capability(
         config_data={"mcp_servers": {"disabled": {"enabled": False}}},
         mcp_module=fake_mcp_module,
     ) == []
-

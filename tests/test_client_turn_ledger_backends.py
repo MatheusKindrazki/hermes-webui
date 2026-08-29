@@ -207,4 +207,3 @@ def test_runner_local_admission_uses_stable_backend_idempotency_key(monkeypatch,
     assert len(captured) == 2
     assert captured[0].metadata["idempotency_key"] == captured[1].metadata["idempotency_key"]
     assert captured[0].metadata["request_sha256"] == captured[1].metadata["request_sha256"]
-

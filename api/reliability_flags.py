@@ -90,4 +90,3 @@ def reliability_feature_enabled(
     canary = reliability.get("canary") if isinstance(reliability, dict) else None
     rule = canary.get(feature_name) if isinstance(canary, dict) else None
     return _canary_rule_enabled(rule, session=session, config_data=config_data)
-
