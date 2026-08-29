@@ -59,7 +59,7 @@ def test_client_turn_ledger_installs_v1_schema(tmp_path):
         "created_at": "REAL",
         "updated_at": "REAL",
     }
-    assert "PRIMARY KEY(lineage_root_id,client_turn_id)" in table_sql.replace(" ", "")
+    assert "PRIMARYKEY(lineage_root_id,client_turn_id)" in table_sql.replace(" ", "")
     assert "turn_id TEXT NOT NULL UNIQUE" in " ".join(table_sql.split())
     for state in (
         "queued",
@@ -112,4 +112,3 @@ def test_same_client_turn_id_with_different_payload_is_conflict(tmp_path):
 
     assert exc_info.value.status_code == 409
     assert exc_info.value.code == "client_turn_id_payload_mismatch"
-
