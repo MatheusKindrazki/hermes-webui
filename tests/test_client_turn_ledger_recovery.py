@@ -151,3 +151,42 @@ def test_recoverable_queue_anchor_keeps_original_receipt(tmp_path, monkeypatch):
         session.session_id, "durable-queue-client"
     )["phase"] == "queue_persisted"
 
+
+def test_cancel_after_thread_start_before_worker_entry_settles_durable_ledger(
+    tmp_path, monkeypatch
+):
+    session = _session(tmp_path, monkeypatch)
+    captured_threads = []
+
+    class DelayedThread:
+        def __init__(self, *, target, args, kwargs, daemon):
+            self.target = target
+            self.args = args
+            self.kwargs = kwargs
+            self.daemon = daemon
+
+        def start(self):
+            captured_threads.append(self)
+
+    monkeypatch.setattr(routes.threading, "Thread", DelayedThread)
+    monkeypatch.setattr(routes, "set_last_workspace", lambda _workspace: None)
+    result = routes._start_chat_stream_for_session(
+        session,
+        **_start_kwargs(tmp_path, "pre-entry-cancel-client"),
+    )
+    stream_id = result["stream_id"]
+    assert len(captured_threads) == 1
+    assert ClientTurnLedger(
+        config.STATE_DIR / "client_turn_ledger.sqlite3"
+    ).get_by_stream(stream_id)["state"] == "started"
+
+    assert streaming.cancel_stream(stream_id) is True
+    assert stream_id not in config.STREAMS
+    assert ClientTurnLedger(
+        config.STATE_DIR / "client_turn_ledger.sqlite3"
+    ).get_by_stream(stream_id)["state"] == "recovery_required"
+    delayed = captured_threads[0]
+    delayed.target(*delayed.args, **delayed.kwargs)
+
+    restarted = ClientTurnLedger(config.STATE_DIR / "client_turn_ledger.sqlite3")
+    assert restarted.get_by_stream(stream_id)["state"] == "recovery_required"

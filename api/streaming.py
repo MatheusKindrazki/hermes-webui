@@ -8980,6 +8980,18 @@ def _run_agent_streaming(
     _turn_route_provider = model_provider
     q = STREAMS.get(stream_id)
     if q is None:
+        try:
+            _settle_client_turn_ledger(
+                stream_id,
+                "recovery_required",
+                current_session_id=session_id,
+            )
+        except Exception:
+            logger.warning(
+                "Failed to settle pre-start local client turn %s",
+                stream_id,
+                exc_info=True,
+            )
         # The stream was cancelled before the worker started; the route layer
         # already registered the stream owner, so release it here to avoid
         # leaking a STREAM_SESSION_OWNERS entry that the teardown finally never sees.
@@ -13501,6 +13513,23 @@ def cancel_stream(stream_id: str) -> bool:
     # _clear_stale_stream_state() can eventually reclaim the session if the
     # worker is stuck in C-level I/O and never reaches its finally (#6623).
     update_active_run(stream_id, phase="cancelling", cancelled_at=time.time())
+
+    # Cancellation is terminal durable evidence even when it races ahead of
+    # worker entry. Settle before eagerly dropping STREAMS so a process exit or
+    # a worker that has not started cannot leave an authoritative `started`
+    # receipt forever.
+    try:
+        _settle_client_turn_ledger(
+            stream_id,
+            "recovery_required",
+            current_session_id=(active_run_session_id or _snap_owner_session_id),
+        )
+    except Exception:
+        logger.warning(
+            "Failed to settle cancelled client turn %s",
+            stream_id,
+            exc_info=True,
+        )
 
     # Set WebUI layer cancel flag. Prefer the snapshot captured under the lock;
     # fall back to a fresh lookup for the ACTIVE_RUNS-only path (stream absent).
