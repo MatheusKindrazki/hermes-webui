@@ -23804,6 +23804,33 @@ def _start_run(
             )
             if adapter is None:
                 raise NotImplementedError("runtime adapter selection returned no adapter")
+            request_metadata = {"route": route, "client_turn_id": client_turn_id}
+            runner_client_turn_id = str(client_turn_id or "").strip()[:128]
+            if runtime_adapter_runner_enabled() and runner_client_turn_id:
+                request_sha256 = _client_turn_request_sha256(
+                    message=msg,
+                    attachments=attachments,
+                    workspace=workspace,
+                    model=model,
+                    model_provider=model_provider,
+                    source=source,
+                )
+                idempotency_material = "\0".join(
+                    (
+                        _client_turn_lineage_root_id(s),
+                        runner_client_turn_id,
+                        request_sha256,
+                    )
+                ).encode("utf-8")
+                request_metadata.update(
+                    {
+                        "request_sha256": request_sha256,
+                        "idempotency_key": (
+                            "client-turn:"
+                            + hashlib.sha256(idempotency_material).hexdigest()
+                        ),
+                    }
+                )
             result = adapter.start_run(
                 StartRunRequest(
                     session_id=s.session_id,
@@ -23814,7 +23841,7 @@ def _start_run(
                     provider=model_provider,
                     model=model,
                     source=source,
-                    metadata={"route": route, "client_turn_id": client_turn_id},
+                    metadata=request_metadata,
                 )
             )
         except NotImplementedError as exc:

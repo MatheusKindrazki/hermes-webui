@@ -54,6 +54,15 @@ class HttpRunnerClient:
         return cls(base_url=base_url, api_key=str(source.get(_RUNNER_API_KEY_ENV) or ""))
 
     def start_run(self, request) -> dict[str, Any]:
+        metadata = dict(request.metadata or {})
+        idempotency_key = str(metadata.get("idempotency_key") or "").strip()
+        if idempotency_key and not all(
+            char.isalnum() or char in {":", ".", "_", "-"}
+            for char in idempotency_key
+        ):
+            raise RunnerClientError("Runner idempotency key contains invalid characters")
+        if len(idempotency_key) > 200:
+            raise RunnerClientError("Runner idempotency key is too long")
         return self._post("/v1/runs", {
             "session_id": request.session_id,
             "message": request.message,
@@ -64,8 +73,12 @@ class HttpRunnerClient:
             "model": request.model,
             "toolsets": list(request.toolsets or []),
             "source": request.source,
-            "metadata": dict(request.metadata or {}),
-        })
+            "metadata": metadata,
+        }, extra_headers=(
+            {"Idempotency-Key": idempotency_key}
+            if idempotency_key
+            else None
+        ))
 
     def observe_run(self, run_id: str, *, cursor: str | None = None) -> dict[str, Any]:
         query = ""
@@ -117,11 +130,20 @@ class HttpRunnerClient:
         req = urllib.request.Request(self.base_url + path, headers=self._headers(), method="GET")
         return self._request_json(req)
 
-    def _post(self, path: str, payload: dict[str, Any]) -> dict[str, Any]:
+    def _post(
+        self,
+        path: str,
+        payload: dict[str, Any],
+        *,
+        extra_headers: dict[str, str] | None = None,
+    ) -> dict[str, Any]:
+        headers = self._headers()
+        if extra_headers:
+            headers.update(extra_headers)
         req = urllib.request.Request(
             self.base_url + path,
             data=json.dumps(payload).encode("utf-8"),
-            headers=self._headers(),
+            headers=headers,
             method="POST",
         )
         return self._request_json(req)

@@ -921,6 +921,20 @@ def _run_gateway_chat_streaming(
     """
     q = STREAMS.get(stream_id)
     if q is None:
+        try:
+            from api.streaming import _settle_client_turn_ledger
+
+            _settle_client_turn_ledger(
+                stream_id,
+                "recovery_required",
+                current_session_id=session_id,
+            )
+        except Exception:
+            logger.warning(
+                "Failed to settle pre-start gateway client turn %s",
+                stream_id,
+                exc_info=True,
+            )
         _finish_gateway_run_starting(stream_id, result="fallback")
         _clear_gateway_run_starting(stream_id)
         # Cancelled before the worker started; release the owner entry the route
@@ -954,11 +968,32 @@ def _run_gateway_chat_streaming(
         STREAM_LIVE_TOOL_CALLS[stream_id] = []
 
     success_writeback_committed = False
+    client_turn_terminal_state = None
     runs_api_pending_marked = True
 
     def put_gateway_event(event, data):
+        nonlocal client_turn_terminal_state
         if cancel_event.is_set() and not success_writeback_committed and event not in ("cancel", "error", "apperror"):
             return
+        if event == "done":
+            client_turn_terminal_state = "completed"
+        elif event == "cancel":
+            client_turn_terminal_state = "recovery_required"
+        elif event in ("error", "apperror"):
+            error_type = (
+                str((data or {}).get("type") or "")
+                if isinstance(data, dict)
+                else ""
+            )
+            if error_type in {
+                "cancelled",
+                "interrupted",
+                "compression_exhausted",
+                "compression_snapshot_stale",
+            }:
+                client_turn_terminal_state = "recovery_required"
+            else:
+                client_turn_terminal_state = "failed_retryable"
         if event == "apperror" and isinstance(data, dict):
             data = data.copy()
             data.setdefault("session_id", session_id)
@@ -1474,6 +1509,29 @@ def _run_gateway_chat_streaming(
             except Exception:
                 logger.debug("Failed to clear gateway stream state", exc_info=True)
             _cleanup_gateway_pending_mirror(session_id)
+        try:
+            from api.streaming import _settle_client_turn_ledger
+
+            ledger_terminal_state = client_turn_terminal_state
+            if ledger_terminal_state is None:
+                ledger_terminal_state = (
+                    "recovery_required"
+                    if cancel_event.is_set()
+                    else "failed_retryable"
+                )
+            _settle_client_turn_ledger(
+                stream_id,
+                ledger_terminal_state,
+                current_session_id=(
+                    getattr(s, "session_id", None) if s is not None else session_id
+                ),
+            )
+        except Exception:
+            logger.warning(
+                "Failed to settle gateway client turn ledger for stream %s",
+                stream_id,
+                exc_info=True,
+            )
         with STREAMS_LOCK:
             AGENT_INSTANCES.pop(stream_id, None)
             CANCEL_FLAGS.pop(stream_id, None)

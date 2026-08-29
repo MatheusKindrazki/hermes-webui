@@ -67,7 +67,10 @@ def test_runner_client_start_run_posts_explicit_boundary_payload(monkeypatch):
             model="gpt-5.5",
             toolsets=["terminal"],
             source="webui",
-            metadata={"route": "/api/chat/start"},
+            metadata={
+                "route": "/api/chat/start",
+                "idempotency_key": "client-turn:test-key",
+            },
         )
     )
 
@@ -75,6 +78,7 @@ def test_runner_client_start_run_posts_explicit_boundary_payload(monkeypatch):
     assert captured["url"] == "http://runner.local/v1/runs"
     assert captured["method"] == "POST"
     assert captured["headers"]["Authorization"] == "Bearer secret"
+    assert captured["headers"]["Idempotency-key"] == "client-turn:test-key"
     assert captured["body"] == {
         "session_id": "s1",
         "message": "hello",
@@ -85,7 +89,10 @@ def test_runner_client_start_run_posts_explicit_boundary_payload(monkeypatch):
         "model": "gpt-5.5",
         "toolsets": ["terminal"],
         "source": "webui",
-        "metadata": {"route": "/api/chat/start"},
+        "metadata": {
+            "route": "/api/chat/start",
+            "idempotency_key": "client-turn:test-key",
+        },
     }
 
 
