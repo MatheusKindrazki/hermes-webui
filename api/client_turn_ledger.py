@@ -248,6 +248,61 @@ class ClientTurnLedger:
             conn.commit()
         return dict(row)
 
+    def transition_by_stream(
+        self,
+        stream_id: str,
+        *,
+        state: str,
+        current_session_id: str | None = None,
+    ) -> dict[str, Any] | None:
+        """Settle the one durable turn currently owned by ``stream_id``."""
+        stream = _required_text(stream_id, "stream_id")
+        if state not in LEDGER_STATES:
+            raise ValueError(f"invalid client turn state: {state}")
+        now = time.time()
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            existing = conn.execute(
+                """
+                SELECT * FROM client_turn_ledger
+                WHERE stream_id = ?
+                ORDER BY updated_at DESC
+                LIMIT 1
+                """,
+                (stream,),
+            ).fetchone()
+            if existing is None:
+                conn.commit()
+                return None
+            next_session = (
+                _required_text(current_session_id, "current_session_id")
+                if current_session_id is not None
+                else existing["current_session_id"]
+            )
+            conn.execute(
+                """
+                UPDATE client_turn_ledger
+                SET state = ?, current_session_id = ?, updated_at = ?
+                WHERE lineage_root_id = ? AND client_turn_id = ?
+                """,
+                (
+                    state,
+                    next_session,
+                    now,
+                    existing["lineage_root_id"],
+                    existing["client_turn_id"],
+                ),
+            )
+            row = conn.execute(
+                """
+                SELECT * FROM client_turn_ledger
+                WHERE lineage_root_id = ? AND client_turn_id = ?
+                """,
+                (existing["lineage_root_id"], existing["client_turn_id"]),
+            ).fetchone()
+            conn.commit()
+        return dict(row)
+
 
 _DEFAULT_LEDGER_CACHE: dict[Path, ClientTurnLedger] = {}
 _DEFAULT_LEDGER_CACHE_LOCK = threading.Lock()

@@ -8666,6 +8666,25 @@ def _refresh_cached_agent_primary_runtime_snapshot(agent) -> None:
             rt['is_anthropic_oauth'] = getattr(agent, '_is_anthropic_oauth')
 
 
+def _settle_client_turn_ledger(
+    stream_id: str,
+    state: str,
+    *,
+    current_session_id: str | None = None,
+):
+    """Persist a stream's terminal state when the default-off ledger is active."""
+    enabled = str(os.getenv("HERMES_TURN_LEDGER_ENABLED", "0") or "0").strip().lower()
+    if enabled not in {"1", "true", "yes", "on"}:
+        return None
+    from api.client_turn_ledger import default_client_turn_ledger
+
+    return default_client_turn_ledger().transition_by_stream(
+        stream_id,
+        state=state,
+        current_session_id=current_session_id,
+    )
+
+
 def _run_agent_streaming(
     session_id,
     msg_text,
@@ -9050,11 +9069,28 @@ def _run_agent_streaming(
     _metering_thread = threading.Thread(target=_metering_ticker, daemon=True)
 
     _success_writeback_committed = False
+    _client_turn_terminal_state = None
 
     def put(event, data):
+        nonlocal _client_turn_terminal_state
         # If cancelled, drop all further events except the cancel event itself
         if cancel_event.is_set() and not _success_writeback_committed and event not in ('cancel', 'apperror'):
             return
+        if event == "done":
+            _client_turn_terminal_state = "completed"
+        elif event == "cancel":
+            _client_turn_terminal_state = "recovery_required"
+        elif event == "apperror":
+            error_type = str((data or {}).get("type") or "") if isinstance(data, dict) else ""
+            if error_type in {
+                "cancelled",
+                "interrupted",
+                "compression_exhausted",
+                "compression_snapshot_stale",
+            }:
+                _client_turn_terminal_state = "recovery_required"
+            else:
+                _client_turn_terminal_state = "failed_retryable"
         event_id = None
         if run_journal is not None:
             try:
@@ -12821,6 +12857,25 @@ def _run_agent_streaming(
         # CLI/cron env fallback resumes — same lifecycle slot as the env
         # restore above.
         _reset_turn_session_identity(_turn_session_identity_tokens)
+        try:
+            _ledger_terminal_state = _client_turn_terminal_state
+            if _ledger_terminal_state is None:
+                _ledger_terminal_state = (
+                    "recovery_required"
+                    if cancel_event.is_set()
+                    else "failed_retryable"
+                )
+            _settle_client_turn_ledger(
+                stream_id,
+                _ledger_terminal_state,
+                current_session_id=getattr(s, "session_id", None) if s is not None else None,
+            )
+        except Exception:
+            logger.warning(
+                "Failed to settle client turn ledger for stream %s",
+                stream_id,
+                exc_info=True,
+            )
         with STREAMS_LOCK:
             STREAMS.pop(stream_id, None)
             CANCEL_FLAGS.pop(stream_id, None)

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import inspect
 import queue
 import sqlite3
 
@@ -183,3 +184,61 @@ def test_start_retry_returns_original_receipt_without_second_worker(tmp_path, mo
     )
     assert mismatch["_status"] == 409
     assert mismatch["code"] == "client_turn_id_payload_mismatch"
+
+
+@pytest.mark.parametrize(
+    "terminal_state",
+    ["completed", "failed_retryable", "recovery_required"],
+)
+def test_stream_terminal_state_is_durable_before_cleanup(
+    tmp_path, monkeypatch, terminal_state
+):
+    state_dir = tmp_path / "state"
+    monkeypatch.setattr(config, "STATE_DIR", state_dir)
+    monkeypatch.setenv("HERMES_TURN_LEDGER_ENABLED", "1")
+    ledger = ClientTurnLedger(state_dir / "client_turn_ledger.sqlite3")
+    receipt = {
+        "stream_id": "stream-terminal",
+        "session_id": "session-parent",
+        "turn_id": "server-terminal",
+    }
+    ledger.claim(
+        lineage_root_id="session-parent",
+        client_turn_id="browser-terminal",
+        turn_id="server-terminal",
+        current_session_id="session-parent",
+        stream_id="stream-terminal",
+        request_sha256="c" * 64,
+        receipt=receipt,
+        state="started",
+    )
+
+    settled = streaming._settle_client_turn_ledger(
+        "stream-terminal",
+        terminal_state,
+        current_session_id="session-tip",
+    )
+
+    assert settled["state"] == terminal_state
+    assert settled["current_session_id"] == "session-tip"
+    restarted = ClientTurnLedger(state_dir / "client_turn_ledger.sqlite3")
+    retry, created = restarted.claim(
+        lineage_root_id="session-parent",
+        client_turn_id="browser-terminal",
+        turn_id="second-worker-must-not-start",
+        current_session_id="session-tip",
+        stream_id="second-stream",
+        request_sha256="c" * 64,
+        receipt={"status": "new-attempt"},
+        state="started",
+    )
+    assert created is False
+    assert json.loads(retry["receipt_json"]) == receipt
+
+
+def test_streaming_settles_ledger_before_stream_registry_cleanup():
+    source = inspect.getsource(streaming._run_agent_streaming)
+    settle_position = source.index("_settle_client_turn_ledger(")
+    cleanup_position = source.index("STREAMS.pop(stream_id, None)")
+
+    assert settle_position < cleanup_position
