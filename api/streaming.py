@@ -8685,6 +8685,18 @@ def _settle_client_turn_ledger(
     )
 
 
+def _rotate_client_turn_ledger_session(old_session_id: str, new_session_id: str) -> int:
+    """Transfer live ledger ownership when compression rotates the WebUI SID."""
+    enabled = str(os.getenv("HERMES_TURN_LEDGER_ENABLED", "0") or "0").strip().lower()
+    if enabled not in {"1", "true", "yes", "on"}:
+        return 0
+    from api.client_turn_ledger import default_client_turn_ledger
+
+    return default_client_turn_ledger().rotate_live_session(
+        old_session_id, new_session_id
+    )
+
+
 def _run_agent_streaming(
     session_id,
     msg_text,
@@ -10972,6 +10984,7 @@ def _run_agent_streaming(
                     _compression_origin_session_id = old_sid
                     _compression_continuation_session_id = new_sid
                     s.session_id = new_sid
+                    _rotate_client_turn_ledger_session(old_sid, new_sid)
                     # Carry profile identity across the compression boundary.
                     # Without this, s.profile stays None on the continuation
                     # session. On the next request, _run_agent_streaming calls

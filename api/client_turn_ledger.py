@@ -303,6 +303,28 @@ class ClientTurnLedger:
             conn.commit()
         return dict(row)
 
+    def rotate_live_session(self, old_session_id: str, new_session_id: str) -> int:
+        """Move live intents to one continuation tip without copying rows."""
+        old_sid = _required_text(old_session_id, "old_session_id")
+        new_sid = _required_text(new_session_id, "new_session_id")
+        if old_sid == new_sid:
+            return 0
+        now = time.time()
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            cursor = conn.execute(
+                """
+                UPDATE client_turn_ledger
+                SET current_session_id = ?, updated_at = ?
+                WHERE current_session_id = ?
+                  AND state IN ('queued','started')
+                """,
+                (new_sid, now, old_sid),
+            )
+            moved = int(cursor.rowcount or 0)
+            conn.commit()
+        return moved
+
 
 _DEFAULT_LEDGER_CACHE: dict[Path, ClientTurnLedger] = {}
 _DEFAULT_LEDGER_CACHE_LOCK = threading.Lock()
