@@ -9363,6 +9363,22 @@ def _run_agent_streaming(
             return
         if event == "done":
             _client_turn_terminal_state = "completed"
+            try:
+                _settle_client_turn_ledger(
+                    stream_id,
+                    "completed",
+                    current_session_id=(
+                        getattr(s, "session_id", None)
+                        if s is not None
+                        else session_id
+                    ),
+                )
+            except Exception:
+                logger.warning(
+                    "Failed to settle successful client turn %s before done",
+                    stream_id,
+                    exc_info=True,
+                )
         elif event == "cancel":
             _client_turn_terminal_state = "recovery_required"
         elif event == "apperror":
@@ -13514,23 +13530,6 @@ def cancel_stream(stream_id: str) -> bool:
     # worker is stuck in C-level I/O and never reaches its finally (#6623).
     update_active_run(stream_id, phase="cancelling", cancelled_at=time.time())
 
-    # Cancellation is terminal durable evidence even when it races ahead of
-    # worker entry. Settle before eagerly dropping STREAMS so a process exit or
-    # a worker that has not started cannot leave an authoritative `started`
-    # receipt forever.
-    try:
-        _settle_client_turn_ledger(
-            stream_id,
-            "recovery_required",
-            current_session_id=(active_run_session_id or _snap_owner_session_id),
-        )
-    except Exception:
-        logger.warning(
-            "Failed to settle cancelled client turn %s",
-            stream_id,
-            exc_info=True,
-        )
-
     # Set WebUI layer cancel flag. Prefer the snapshot captured under the lock;
     # fall back to a fresh lookup for the ACTIVE_RUNS-only path (stream absent).
     flag = _snap_flag if _snap_flag is not None else cancel_flags.get(stream_id)
@@ -13549,6 +13548,33 @@ def cancel_stream(stream_id: str) -> bool:
                 agent = cached[0]
         except Exception:
             pass
+    _cancel_session_id = getattr(agent, 'session_id', None) if agent else None
+    if not _cancel_session_id and active_run_session_id:
+        _cancel_session_id = active_run_session_id
+    if not _cancel_session_id and _snap_owner_session_id:
+        _cancel_session_id = _snap_owner_session_id
+
+    # Confirm writeback ownership before recording cancellation. A late Stop
+    # can arrive after the success save cleared active_stream_id but before the
+    # worker's registry cleanup. In that window this stream no longer owns the
+    # session and must not downgrade a completed durable receipt.
+    _ownership_session = None
+    if _cancel_session_id:
+        with _get_session_agent_lock(_cancel_session_id):
+            try:
+                _ownership_session = get_session(_cancel_session_id)
+                if _stream_writeback_is_current(_ownership_session, stream_id):
+                    _settle_client_turn_ledger(
+                        stream_id,
+                        "recovery_required",
+                        current_session_id=_cancel_session_id,
+                    )
+            except Exception:
+                logger.warning(
+                    "Failed to confirm or settle cancelled client turn %s",
+                    stream_id,
+                    exc_info=True,
+                )
     if agent:
         try:
             agent.interrupt("Cancelled by user")
@@ -13602,7 +13628,6 @@ def cancel_stream(stream_id: str) -> bool:
     # Session cleanup (get_session + save) must happen OUTSIDE the lock —
     # get_session() acquires LOCK, and the streaming thread does LOCK first
     # then STREAMS_LOCK, so inverting the order here would cause deadlock.
-    _cancel_session_id = getattr(agent, 'session_id', None) if agent else None
     if not _cancel_session_id and active_run_session_id:
         _cancel_session_id = active_run_session_id
     # Third fallback: stream owner registry — populated before the worker
@@ -13643,7 +13668,11 @@ def cancel_stream(stream_id: str) -> bool:
     if _cancel_session_id:
         with _get_session_agent_lock(_cancel_session_id):
             try:
-                _cs = get_session(_cancel_session_id)
+                _cs = (
+                    _ownership_session
+                    if _ownership_session is not None
+                    else get_session(_cancel_session_id)
+                )
                 if not isinstance(getattr(_cs, 'messages', None), list):
                     _cs.messages = []
                 if not _stream_writeback_is_current(_cs, stream_id):

@@ -190,3 +190,45 @@ def test_cancel_after_thread_start_before_worker_entry_settles_durable_ledger(
 
     restarted = ClientTurnLedger(config.STATE_DIR / "client_turn_ledger.sqlite3")
     assert restarted.get_by_stream(stream_id)["state"] == "recovery_required"
+
+
+def test_late_stop_after_success_writeback_cannot_downgrade_completed_ledger(
+    tmp_path, monkeypatch
+):
+    session = _session(tmp_path, monkeypatch)
+    stream_id = "late-stop-after-success"
+    session.active_stream_id = None
+    session.pending_user_message = None
+    session.messages = [
+        {"role": "user", "content": "finish"},
+        {"role": "assistant", "content": "finished"},
+    ]
+    session.save()
+    config.STREAMS[stream_id] = queue.Queue()
+    config.register_stream_owner(stream_id, session.session_id)
+    ledger = ClientTurnLedger(config.STATE_DIR / "client_turn_ledger.sqlite3")
+    ledger.claim(
+        lineage_root_id=session.session_id,
+        client_turn_id="late-stop-client",
+        turn_id="late-stop-turn",
+        current_session_id=session.session_id,
+        stream_id=stream_id,
+        request_sha256="e" * 64,
+        receipt={
+            "stream_id": stream_id,
+            "session_id": session.session_id,
+            "turn_id": "late-stop-turn",
+        },
+        state="started",
+    )
+    streaming._settle_client_turn_ledger(
+        stream_id,
+        "completed",
+        current_session_id=session.session_id,
+    )
+
+    assert streaming.cancel_stream(stream_id) is True
+
+    restarted = ClientTurnLedger(config.STATE_DIR / "client_turn_ledger.sqlite3")
+    assert restarted.get_by_stream(stream_id)["state"] == "completed"
+    assert models.Session.load(session.session_id).messages[-1]["content"] == "finished"

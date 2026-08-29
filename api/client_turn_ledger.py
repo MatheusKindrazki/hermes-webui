@@ -25,6 +25,9 @@ LEDGER_STATES = frozenset(
         "failed_retryable",
     }
 )
+TERMINAL_LEDGER_STATES = frozenset(
+    {"completed", "recovery_required", "failed_retryable"}
+)
 
 _SCHEMA_V1 = """
 CREATE TABLE IF NOT EXISTS client_turn_ledger(
@@ -333,6 +336,12 @@ class ClientTurnLedger:
             if existing is None:
                 conn.rollback()
                 raise KeyError((lineage, client_id))
+            if (
+                str(existing["state"]) in TERMINAL_LEDGER_STATES
+                and str(existing["state"]) != state
+            ):
+                conn.commit()
+                return dict(existing)
             next_stream = str(stream_id) if stream_id is not None else existing["stream_id"]
             next_session = (
                 _required_text(current_session_id, "current_session_id")
@@ -392,6 +401,12 @@ class ClientTurnLedger:
             if existing is None:
                 conn.commit()
                 return None
+            if (
+                str(existing["state"]) in TERMINAL_LEDGER_STATES
+                and str(existing["state"]) != state
+            ):
+                conn.commit()
+                return dict(existing)
             next_session = (
                 _required_text(current_session_id, "current_session_id")
                 if current_session_id is not None
