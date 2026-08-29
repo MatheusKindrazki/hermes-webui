@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import inspect
 import sqlite3
 
 from api import config, streaming
@@ -59,10 +58,28 @@ def test_live_intents_move_once_to_continuation_without_parent_copy(tmp_path, mo
     assert replayable_parent_rows == 0
 
 
-def test_compression_rotation_updates_ledger_before_linking_tip():
-    source = inspect.getsource(streaming._run_agent_streaming)
-    session_rotation = source.index("s.session_id = new_sid")
-    ledger_rotation = source.index("_rotate_client_turn_ledger_session(old_sid, new_sid)")
-    parent_link = source.index("s.parent_session_id = old_sid")
+def test_compression_rotation_updates_ledger_before_linking_tip(tmp_path, monkeypatch):
+    state_dir = tmp_path / "state"
+    monkeypatch.setattr(config, "STATE_DIR", state_dir)
+    ledger = ClientTurnLedger(state_dir / "client_turn_ledger.sqlite3")
+    _claim(
+        ledger,
+        client_turn_id="link-client",
+        turn_id="link-turn",
+        state="started",
+    )
+    observations = []
 
-    assert session_rotation < ledger_rotation < parent_link
+    def link_tip():
+        observations.append(
+            ledger.get("session-parent", "link-client")["current_session_id"]
+        )
+
+    moved, link_after_rotation = streaming._rotate_client_turn_before_link(
+        "session-parent",
+        "session-tip",
+    )
+    link_after_rotation(link_tip)
+
+    assert moved == 1
+    assert observations == ["session-tip"]

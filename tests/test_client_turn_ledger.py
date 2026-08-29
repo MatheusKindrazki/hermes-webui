@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import inspect
 import queue
 import sqlite3
 
@@ -288,9 +287,40 @@ def test_stream_terminal_state_is_durable_before_cleanup(
     assert json.loads(retry["receipt_json"]) == receipt
 
 
-def test_streaming_settles_ledger_before_stream_registry_cleanup():
-    source = inspect.getsource(streaming._run_agent_streaming)
-    settle_position = source.index("_settle_client_turn_ledger(")
-    cleanup_position = source.index("STREAMS.pop(stream_id, None)")
+def test_streaming_settles_ledger_before_stream_registry_cleanup(
+    tmp_path, monkeypatch
+):
+    state_dir = tmp_path / "state"
+    monkeypatch.setattr(config, "STATE_DIR", state_dir)
+    ledger = ClientTurnLedger(state_dir / "client_turn_ledger.sqlite3")
+    ledger.claim(
+        lineage_root_id="lineage-cleanup",
+        client_turn_id="client-cleanup",
+        turn_id="turn-cleanup",
+        current_session_id="session-cleanup",
+        stream_id="stream-cleanup",
+        request_sha256="d" * 64,
+        receipt={"stream_id": "stream-cleanup"},
+        state="started",
+    )
+    config.STREAMS["stream-cleanup"] = queue.Queue()
+    observed = []
 
-    assert settle_position < cleanup_position
+    def cleanup():
+        observed.append(
+            (
+                ledger.get_by_stream("stream-cleanup")["state"],
+                "stream-cleanup" in config.STREAMS,
+            )
+        )
+        config.STREAMS.pop("stream-cleanup", None)
+
+    streaming._settle_client_turn_before_cleanup(
+        "stream-cleanup",
+        "completed",
+        current_session_id="session-cleanup",
+        cleanup=cleanup,
+    )
+
+    assert observed == [("completed", True)]
+    assert "stream-cleanup" not in config.STREAMS

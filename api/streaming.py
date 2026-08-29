@@ -2874,6 +2874,17 @@ def _reset_request_context_v2(context: dict | None) -> None:
         logger.debug("Failed to restore v2 thread env", exc_info=True)
 
 
+def _reset_request_context_v2_before_cleanup(
+    context: dict | None,
+    *,
+    cleanup=None,
+) -> None:
+    """Release scoped identity before any teardown observer is invoked."""
+    _reset_request_context_v2(context)
+    if cleanup is not None:
+        cleanup()
+
+
 _streaming_hermes_home_override_available = None
 
 
@@ -8896,6 +8907,32 @@ def _settle_client_turn_ledger(
     )
 
 
+def _settle_client_turn_before_cleanup(
+    stream_id: str,
+    state: str,
+    *,
+    current_session_id: str | None = None,
+    cleanup,
+):
+    """Run terminal settlement before releasing the stream registry owner."""
+    settled = None
+    try:
+        settled = _settle_client_turn_ledger(
+            stream_id,
+            state,
+            current_session_id=current_session_id,
+        )
+    except Exception:
+        logger.warning(
+            "Failed to settle client turn ledger for stream %s",
+            stream_id,
+            exc_info=True,
+        )
+    finally:
+        cleanup()
+    return settled
+
+
 def _rotate_client_turn_ledger_session(old_session_id: str, new_session_id: str) -> int:
     """Transfer already-admitted rows even after the global switch is killed."""
     from api.client_turn_ledger import _default_db_path, default_client_turn_ledger
@@ -8906,6 +8943,19 @@ def _rotate_client_turn_ledger_session(old_session_id: str, new_session_id: str)
     return default_client_turn_ledger().rotate_live_session(
         old_session_id, new_session_id
     )
+
+
+def _rotate_client_turn_before_link(
+    old_session_id: str,
+    new_session_id: str,
+):
+    """Return a link gate only after live client turns own the continuation SID."""
+    moved = _rotate_client_turn_ledger_session(old_session_id, new_session_id)
+
+    def link_after_rotation(callback):
+        return callback()
+
+    return moved, link_after_rotation
 
 
 def _run_agent_streaming(
@@ -11237,7 +11287,9 @@ def _run_agent_streaming(
                     _compression_origin_session_id = old_sid
                     _compression_continuation_session_id = new_sid
                     s.session_id = new_sid
-                    _rotate_client_turn_ledger_session(old_sid, new_sid)
+                    _, _link_client_turn_tip_after_rotation = (
+                        _rotate_client_turn_before_link(old_sid, new_sid)
+                    )
                     # Carry profile identity across the compression boundary.
                     # Without this, s.profile stays None on the continuation
                     # session. On the next request, _run_agent_streaming calls
@@ -11285,7 +11337,9 @@ def _run_agent_streaming(
                     # subsequent traversal from the new continuation would jump
                     # over the just-preserved snapshot back to the original fork
                     # parent, losing access to the recoverable history in old_sid.json.
-                    s.parent_session_id = old_sid
+                    _link_client_turn_tip_after_rotation(
+                        lambda: setattr(s, "parent_session_id", old_sid)
+                    )
                     with LOCK:
                         cached_old_session = SESSIONS.pop(old_sid, None)
                         if cached_old_session is not None and cached_old_session is not s:
@@ -13103,7 +13157,7 @@ def _run_agent_streaming(
             update_active_run(stream_id, phase="finalizing")
             _last_resort_sync_from_core(s, stream_id, _agent_lock)
         if _request_context_v2_ctx is not None:
-            _reset_request_context_v2(_request_context_v2_ctx)
+            _reset_request_context_v2_before_cleanup(_request_context_v2_ctx)
             _request_context_v2_ctx = None
         else:
             _clear_thread_env()  # TD1: always clear thread-local context
@@ -13129,57 +13183,49 @@ def _run_agent_streaming(
         # CLI/cron env fallback resumes — same lifecycle slot as the env
         # restore above.
         _reset_turn_session_identity(_turn_session_identity_tokens)
-        try:
-            _ledger_terminal_state = _client_turn_terminal_state
-            if _ledger_terminal_state is None:
-                _ledger_terminal_state = (
-                    "recovery_required"
-                    if cancel_event.is_set()
-                    else "failed_retryable"
-                )
-            _settle_client_turn_ledger(
-                stream_id,
-                _ledger_terminal_state,
-                current_session_id=getattr(s, "session_id", None) if s is not None else None,
+        _ledger_terminal_state = _client_turn_terminal_state
+        if _ledger_terminal_state is None:
+            _ledger_terminal_state = (
+                "recovery_required"
+                if cancel_event.is_set()
+                else "failed_retryable"
             )
-        except Exception:
-            logger.warning(
-                "Failed to settle client turn ledger for stream %s",
-                stream_id,
-                exc_info=True,
-            )
-        with STREAMS_LOCK:
-            STREAMS.pop(stream_id, None)
-            CANCEL_FLAGS.pop(stream_id, None)
-            AGENT_INSTANCES.pop(stream_id, None)  # Clean up agent instance reference
-            STREAM_PARTIAL_TEXT.pop(stream_id, None)  # Clean up partial text buffer (#893)
-            STREAM_REASONING_TEXT.pop(stream_id, None)  # Clean up reasoning trace (#1361 §A)
-            STREAM_LIVE_TOOL_CALLS.pop(stream_id, None)  # Clean up tool calls (#1361 §B)
-            STREAM_GOAL_RELATED.pop(stream_id, None)  # Clean up goal-related flag (#1932)
-            STREAM_LAST_EVENT_ID.pop(stream_id, None)  # Clean up event_id pointer (stage-364)
-            unregister_active_run(stream_id)
-            # Clean up the stream-owner registry so stale stream_id→session_id
-            # mappings do not accumulate over thousands of completed streams (#6351).
-            unregister_stream_owner(stream_id)
-            # Release the session's writeback-ownership entry only while this
-            # stream still owns it (#6623 re-gate): a successor admitted after
-            # cancel must keep its registry claim.
-            try:
-                clear_session_writeback_owner_if_owned(session_id, stream_id)
-            except Exception:
-                logger.debug(
-                    "Failed to clear session writeback owner for stream %s", stream_id,
-                    exc_info=True,
-                )
-            # NOTE: do NOT discard PENDING_GOAL_CONTINUATION here. The marker
-            # is set by goal_continue (line ~3328) inside the SAME function
-            # call and consumed atomically by `_start_chat_stream_for_session`
-            # in routes.py (around line 6522) when the next stream starts.
-            # Discarding here in the streaming worker's `finally` would
-            # almost always race ahead of the frontend's SSE-receive →
-            # POST /api/chat/start round-trip and erase the marker before
-            # the next stream can read it, breaking the goal-continuation
-            # chain. Stage-326 critical fix per Opus advisor review.
+
+        def _cleanup_local_stream_registries():
+            with STREAMS_LOCK:
+                STREAMS.pop(stream_id, None)
+                CANCEL_FLAGS.pop(stream_id, None)
+                AGENT_INSTANCES.pop(stream_id, None)
+                STREAM_PARTIAL_TEXT.pop(stream_id, None)
+                STREAM_REASONING_TEXT.pop(stream_id, None)
+                STREAM_LIVE_TOOL_CALLS.pop(stream_id, None)
+                STREAM_GOAL_RELATED.pop(stream_id, None)
+                STREAM_LAST_EVENT_ID.pop(stream_id, None)
+                unregister_active_run(stream_id)
+                unregister_stream_owner(stream_id)
+                try:
+                    clear_session_writeback_owner_if_owned(session_id, stream_id)
+                except Exception:
+                    logger.debug(
+                        "Failed to clear session writeback owner for stream %s",
+                        stream_id,
+                        exc_info=True,
+                    )
+
+        # The callback owns the registry pop, so the durable ledger transition
+        # is behaviorally guaranteed to finish first (or record its failure)
+        # rather than relying on source-line placement.
+        _settle_client_turn_before_cleanup(
+            stream_id,
+            _ledger_terminal_state,
+            current_session_id=(
+                getattr(s, "session_id", None) if s is not None else None
+            ),
+            cleanup=_cleanup_local_stream_registries,
+        )
+        # NOTE: do NOT discard PENDING_GOAL_CONTINUATION here. The marker is
+        # consumed atomically by `_start_chat_stream_for_session`; removing it
+        # during teardown would race the next goal-continuation POST.
 
         # ── Defer-path fix: turn-teardown idle-hook ────────────────────────
         # The session has just transitioned active→idle: unregister_active_run

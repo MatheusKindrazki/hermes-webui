@@ -993,19 +993,39 @@ def test_request_context_v2_interleaves_profiles_without_process_env_authority(
     assert os.environ["OPENAI_API_KEY"] == "process-default-secret"
 
 
-def test_streaming_worker_wires_v2_scope_and_guards_process_env_mirror():
-    """The production worker must consume the isolated scope, not leave it dormant."""
-    import inspect
+def test_request_context_v2_resets_scope_before_cleanup_callback(monkeypatch, tmp_path):
+    """Teardown observers see process defaults, never the completed profile scope."""
+    from api import config, streaming
 
-    from api import streaming
+    monkeypatch.setenv("HERMES_REQUEST_CONTEXT_V2", "1")
+    monkeypatch.setenv("HERMES_HOME", "/process/default-home")
+    monkeypatch.setenv("OPENAI_API_KEY", "process-default-secret")
+    context = streaming._install_request_context_v2(
+        thread_env={
+            "HERMES_HOME": str(tmp_path / "profile-home"),
+            "OPENAI_API_KEY": "profile-secret",
+        },
+        session_id="session-cleanup",
+        workspace=str(tmp_path),
+        profile="work",
+    )
+    observed = []
 
-    source = inspect.getsource(streaming._run_agent_streaming)
-    flag_position = source.index("_request_context_v2 = _request_context_v2_enabled()")
-    install_position = source.index("_install_request_context_v2(")
-    mirror_guard_position = source.index("if not _request_context_v2:", install_position)
-    mirror_position = source.index("os.environ.update(_safe_profile_runtime_env)")
-    reset_position = source.index("_reset_request_context_v2(")
-    cleanup_position = source.index("STREAMS.pop(stream_id, None)")
+    streaming._reset_request_context_v2_before_cleanup(
+        context,
+        cleanup=lambda: observed.append(
+            {
+                "thread_secret": config._thread_local_env_value("OPENAI_API_KEY"),
+                "process_secret": os.environ.get("OPENAI_API_KEY"),
+                "process_home": os.environ.get("HERMES_HOME"),
+            }
+        ),
+    )
 
-    assert flag_position < install_position < mirror_guard_position < mirror_position
-    assert reset_position < cleanup_position
+    assert observed == [
+        {
+            "thread_secret": "process-default-secret",
+            "process_secret": "process-default-secret",
+            "process_home": "/process/default-home",
+        }
+    ]
