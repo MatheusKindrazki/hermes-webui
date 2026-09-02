@@ -5397,6 +5397,55 @@ function _syncSessionAttentionSoundState(sessions){
 // advance each poll so its signature changes and it still renders. Serialization
 // failure returns null → never skip (fail-open). (#5455 WS2.4)
 let _lastSessionListRenderSig = null;
+
+// K12 Operational Twin.  Work lifecycle state belongs to Jarvis; this browser
+// keeps a separate read-only view so a Work update can never replace S.session,
+// steal composer focus, or clear a busy streaming turn.
+let _workControlProjection=null;
+let _workControlProjectionTimer=0;
+function _workBucket(work){
+  const status=String((work&&work.status)||'').toLowerCase();
+  if(/waiting|input|approval|clarify/.test(status)) return 'Waiting You';
+  if(/blocked|failed|error/.test(status)) return 'Blocked';
+  if(/verif|review|collect/.test(status)) return 'Verifying';
+  if(/complete|done|closed/.test(status)) return 'Done Today';
+  if(/risk|stale|overdue/.test(status)) return 'At Risk';
+  return 'Now';
+}
+function _renderWorkControlProjection(payload){
+  _workControlProjection=payload&&typeof payload==='object'?payload:null;
+  let root=document.getElementById('workControlProjection');
+  const list=$('sessionList');
+  if(!root&&list&&list.parentNode){
+    root=document.createElement('section'); root.id='workControlProjection';
+    root.className='work-control-projection'; root.setAttribute('aria-live','polite');
+    list.parentNode.insertBefore(root,list.nextSibling);
+  }
+  if(!root) return;
+  const works=Array.isArray(payload&&payload.records)?payload.records:[];
+  const buckets=['Now','Waiting You','Blocked','Verifying','Done Today','At Risk'];
+  const groups=buckets.map(bucket=>{
+    const rows=works.filter(w=>_workBucket(w)===bucket);
+    if(!rows.length) return '';
+    return `<div class="work-bucket"><strong>${esc(bucket)}</strong>${rows.map(w=>`<div class="work-row" data-work-id="${esc(String(w.work_id||''))}"><span>${esc(String(w.title||w.work_id||'Work'))}</span><small>${esc(String(w.status||''))}</small></div>`).join('')}</div>`;
+  }).join('');
+  const stale=payload&&payload.stale;
+  root.classList.toggle('stale',!!stale);
+  root.innerHTML=`<div class="work-control-heading">Work Control <small>${stale?'Dados desatualizados — mantendo último snapshot':'Live read-only'}</small></div>${groups||'<div class="work-control-empty">Nenhum Work projetado.</div>'}`;
+}
+async function refreshWorkControlProjection(){
+  try{
+    const response=await fetch('/api/work-control/projection',{cache:'no-store',credentials:'same-origin'});
+    const payload=await response.json();
+    if(response.ok) _renderWorkControlProjection(payload);
+    else if(_workControlProjection) _renderWorkControlProjection({..._workControlProjection,stale:true});
+  }catch(_){ if(_workControlProjection) _renderWorkControlProjection({..._workControlProjection,stale:true}); }
+}
+function ensureWorkControlProjectionPoll(){
+  if(_workControlProjectionTimer) return;
+  void refreshWorkControlProjection();
+  _workControlProjectionTimer=setInterval(()=>void refreshWorkControlProjection(),30000);
+}
 function _sessionListRenderSignature(){
   try{
     const search=($('sessionSearch')&&$('sessionSearch').value)||'';
@@ -5506,6 +5555,7 @@ function _applySessionListPayload(sessData, projData, opts){
     _sessionListFirstRenderAnimated=true;
   }
   ensureSessionEventsSSE();
+  ensureWorkControlProjectionPoll();
   // #4671: this payload is the freshly-resolved /api/sessions response (and a superseded
   // response was already discarded by the generation guard upstream), so _allSessions now
   // holds the CURRENT profile's rows. Clear the skeleton flag right before painting so this
