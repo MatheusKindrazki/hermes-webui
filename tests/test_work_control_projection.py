@@ -104,7 +104,29 @@ def test_forced_refresh_is_throttled_within_minimum_interval():
         return _payload(calls)
     adapter = WorkControlProjection(fetcher=fetcher, now=lambda: now[0])
     assert adapter.get(force=True)["source"] == "remote"
-    assert adapter.get(force=True)["source"] == "cache"
+    throttled = adapter.get(force=True)
+    assert throttled["source"] == "refresh_throttled"
+    assert throttled["stale"] is True
+    assert calls == 1
+
+
+def test_failed_initial_force_refresh_is_throttled_without_second_fetch():
+    calls = 0
+    now = [100.0]
+
+    def fetcher():
+        nonlocal calls
+        calls += 1
+        raise OSError("down")
+
+    adapter = WorkControlProjection(fetcher=fetcher, now=lambda: now[0])
+    for expected_message in ("work-control projection unavailable", "work-control projection refresh throttled"):
+        try:
+            adapter.get(force=True)
+        except ProjectionUnavailable as exc:
+            assert str(exc) == expected_message
+        else:
+            raise AssertionError("failed/throttled refresh must fail closed")
     assert calls == 1
 
 

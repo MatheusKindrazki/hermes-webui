@@ -50,7 +50,9 @@ class WorkControlProjection:
             now = self._now()
             if force:
                 if self._last_force_at is not None and now - self._last_force_at < MIN_FORCE_REFRESH_INTERVAL_SECONDS:
-                    force = False
+                    if self._snapshot is not None:
+                        return self._with_freshness(self._snapshot, stale=True, source="refresh_throttled")
+                    raise ProjectionUnavailable("work-control projection refresh throttled")
                 else:
                     self._last_force_at = now
             if not force and self._snapshot is not None and self._now() - self._fetched_at < CACHE_TTL_SECONDS:
