@@ -13111,6 +13111,16 @@ def handle_get(handler, parsed) -> bool:
     if parsed.path.startswith("/api/") and not _guard_request_session_visibility(handler, parsed, method="GET"):
         return True
 
+    # Operational Twin is intentionally a separate, read-only projection.
+    # It must not be folded into /api/sessions: a Work can outlive, or have no,
+    # focused chat session and an unavailable authority is never an empty board.
+    if parsed.path == "/api/work-control/projection":
+        from api.work_control_projection import ProjectionUnavailable, projection
+        try:
+            return j(handler, projection.get(force=_query_flag(parsed, "refresh")), pretty=False)
+        except ProjectionUnavailable:
+            return j(handler, {"error": "work-control projection unavailable", "stale": True}, status=503)
+
     # ── Insights / knowledge status ──
     if parsed.path == "/api/insights":
         return _handle_insights(handler, parsed)
