@@ -13,15 +13,24 @@ import threading
 import time
 from typing import Any, Callable
 from urllib.error import URLError
-from urllib.request import Request, urlopen
+from urllib.parse import urlsplit
+from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 SCHEMA = "hermes-kernel-projection.v1"
 TIMEOUT_SECONDS = 2.0
 CACHE_TTL_SECONDS = 30.0
+MIN_FORCE_REFRESH_INTERVAL_SECONDS = 5.0
 
 
 class ProjectionUnavailable(RuntimeError):
     """The authority could not return a valid projection in the contract time."""
+
+
+class _RejectRedirects(HTTPRedirectHandler):
+    """Stop before urllib can copy the read credential to another request."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: ANN001
+        raise ProjectionUnavailable("work-control authority redirects are forbidden")
 
 
 class WorkControlProjection:
@@ -33,10 +42,17 @@ class WorkControlProjection:
         self._lock = threading.Lock()
         self._snapshot: dict[str, Any] | None = None
         self._fetched_at = 0.0
+        self._last_force_at: float | None = None
         self._authority_versions: dict[str, int] = {}
 
     def get(self, *, force: bool = False) -> dict[str, Any]:
         with self._lock:
+            now = self._now()
+            if force:
+                if self._last_force_at is not None and now - self._last_force_at < MIN_FORCE_REFRESH_INTERVAL_SECONDS:
+                    force = False
+                else:
+                    self._last_force_at = now
             if not force and self._snapshot is not None and self._now() - self._fetched_at < CACHE_TTL_SECONDS:
                 return self._with_freshness(self._snapshot, stale=False, source="cache")
             try:
@@ -64,9 +80,12 @@ class WorkControlProjection:
         token = os.environ.get("HERMES_WORK_CONTROL_READ_TOKEN", "").strip()
         if not endpoint or not token:
             raise ProjectionUnavailable("work-control read authority is not configured")
+        parsed = urlsplit(endpoint)
+        if parsed.scheme.lower() != "https" or not parsed.hostname:
+            raise ProjectionUnavailable("work-control authority must use https")
         request = Request(endpoint, headers={"X-API-Key": token, "Accept": "application/json"}, method="GET")
         try:
-            with urlopen(request, timeout=TIMEOUT_SECONDS) as response:  # nosec B310: explicit configured authority
+            with build_opener(_RejectRedirects()).open(request, timeout=TIMEOUT_SECONDS) as response:
                 if getattr(response, "status", 200) != 200:
                     raise ProjectionUnavailable(f"authority returned {response.status}")
                 return json.loads(response.read().decode("utf-8"))

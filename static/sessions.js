@@ -5403,6 +5403,7 @@ let _lastSessionListRenderSig = null;
 // steal composer focus, or clear a busy streaming turn.
 let _workControlProjection=null;
 let _workControlProjectionTimer=0;
+let _workControlProjectionRequestGeneration=0;
 function _workBucket(work){
   const status=String((work&&work.status)||'').toLowerCase();
   if(/waiting|input|approval|clarify/.test(status)) return 'Waiting You';
@@ -5430,16 +5431,27 @@ function _renderWorkControlProjection(payload){
     return `<div class="work-bucket"><strong>${esc(bucket)}</strong>${rows.map(w=>`<div class="work-row" data-work-id="${esc(String(w.work_id||''))}"><span>${esc(String(w.title||w.work_id||'Work'))}</span><small>${esc(String(w.status||''))}</small></div>`).join('')}</div>`;
   }).join('');
   const stale=payload&&payload.stale;
+  const unavailable=payload&&payload.unavailable;
   root.classList.toggle('stale',!!stale);
-  root.innerHTML=`<div class="work-control-heading">Work Control <small>${stale?'Dados desatualizados — mantendo último snapshot':'Live read-only'}</small></div>${groups||'<div class="work-control-empty">Nenhum Work projetado.</div>'}`;
+  const stateLabel=unavailable?'Indisponível — sem snapshot autoritativo':(stale?'Dados desatualizados — mantendo último snapshot':'Live read-only');
+  const emptyLabel=unavailable?'Work Control indisponível.':'Nenhum Work projetado.';
+  root.innerHTML=`<div class="work-control-heading">Work Control <small>${stateLabel}</small></div>${groups||`<div class="work-control-empty">${emptyLabel}</div>`}`;
 }
 async function refreshWorkControlProjection(){
+  const generation=++_workControlProjectionRequestGeneration;
   try{
-    const response=await fetch('/api/work-control/projection',{cache:'no-store',credentials:'same-origin'});
+    const endpoint=new URL('api/work-control/projection',document.baseURI||location.href).href;
+    const response=await fetch(endpoint,{cache:'no-store',credentials:'same-origin'});
     const payload=await response.json();
+    if(generation!==_workControlProjectionRequestGeneration) return;
     if(response.ok) _renderWorkControlProjection(payload);
     else if(_workControlProjection) _renderWorkControlProjection({..._workControlProjection,stale:true});
-  }catch(_){ if(_workControlProjection) _renderWorkControlProjection({..._workControlProjection,stale:true}); }
+    else _renderWorkControlProjection({records:[],stale:true,unavailable:true});
+  }catch(_){
+    if(generation!==_workControlProjectionRequestGeneration) return;
+    if(_workControlProjection) _renderWorkControlProjection({..._workControlProjection,stale:true});
+    else _renderWorkControlProjection({records:[],stale:true,unavailable:true});
+  }
 }
 function ensureWorkControlProjectionPoll(){
   if(_workControlProjectionTimer) return;
